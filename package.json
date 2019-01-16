@@ -16,7 +16,6 @@
     "clean": "rimraf lib dist",
     "build": "babel -s -d lib src && rimraf dist && mkdir dist && browserify -d browser-index.js | exorcist dist/browser-matrix.js.map > dist/browser-matrix.js && uglifyjs -c -m -o dist/browser-matrix.min.js --source-map dist/browser-matrix.min.js.map --in-source-map dist/browser-matrix.js.map dist/browser-matrix.js",
     "dist": "npm run build",
-    "postinstall": "npm run clean && npm run build",
     "watch": "watchify -d browser-index.js -o 'exorcist dist/browser-matrix.js.map > dist/browser-matrix.js' -v",
     "lint": "eslint --max-warnings 102 src spec",
     "prepublish": "npm run clean && npm run build && git rev-parse HEAD > git-revision.txt"
@@ -60,10 +59,10 @@
     "content-type": "^1.0.2",
     "loglevel": "1.6.1",
     "qs": "^6.5.2",
-    "request": "^2.88.0",
-    "babel-cli": "^6.18.0"
+    "request": "^2.88.0"
   },
   "devDependencies": {
+    "babel-cli": "^6.18.0",
     "babel-eslint": "^8.1.1",
     "babel-plugin-transform-async-to-bluebird": "^1.1.1",
     "babel-plugin-transform-runtime": "^6.23.0",
