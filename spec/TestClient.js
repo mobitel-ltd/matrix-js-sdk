@@ -1,7 +1,7 @@
 /*
 Copyright 2016 OpenMarket Ltd
 Copyright 2017 Vector Creations Ltd
-Copyright 2018 New Vector Ltd
+Copyright 2018-2019 New Vector Ltd
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@ import MockHttpBackend from 'matrix-mock-request';
 import expect from 'expect';
 import Promise from 'bluebird';
 import LocalStorageCryptoStore from '../lib/crypto/store/localStorage-crypto-store';
+import logger from '../src/logger';
 
 /**
  * Wrapper for a MockStorageApi, MockHttpBackend and MatrixClient
@@ -38,9 +39,10 @@ import LocalStorageCryptoStore from '../lib/crypto/store/localStorage-crypto-sto
  *
  * @param {WebStorage=} sessionStoreBackend a web storage object to use for the
  *     session store. If undefined, we will create a MockStorageApi.
+ * @param {object} options additional options to pass to the client
  */
 export default function TestClient(
-    userId, deviceId, accessToken, sessionStoreBackend,
+    userId, deviceId, accessToken, sessionStoreBackend, options,
 ) {
     this.userId = userId;
     this.deviceId = deviceId;
@@ -50,19 +52,22 @@ export default function TestClient(
     }
     const sessionStore = new sdk.WebStorageSessionStore(sessionStoreBackend);
 
-    // expose this so the tests can get to it
-    this.cryptoStore = new LocalStorageCryptoStore(sessionStoreBackend);
-
     this.httpBackend = new MockHttpBackend();
-    this.client = sdk.createClient({
+
+    options = Object.assign({
         baseUrl: "http://" + userId + ".test.server",
         userId: userId,
         accessToken: accessToken,
         deviceId: deviceId,
         sessionStore: sessionStore,
-        cryptoStore: this.cryptoStore,
         request: this.httpBackend.requestFn,
-    });
+    }, options);
+    if (!options.cryptoStore) {
+        // expose this so the tests can get to it
+        this.cryptoStore = new LocalStorageCryptoStore(sessionStoreBackend);
+        options.cryptoStore = this.cryptoStore;
+    }
+    this.client = sdk.createClient(options);
 
     this.deviceKeys = null;
     this.oneTimeKeys = {};
@@ -78,7 +83,7 @@ TestClient.prototype.toString = function() {
  * @return {Promise}
  */
 TestClient.prototype.start = function() {
-    console.log(this + ': starting');
+    logger.log(this + ': starting');
     this.httpBackend.when("GET", "/pushrules").respond(200, {});
     this.httpBackend.when("POST", "/filter").respond(200, { filter_id: "fid" });
     this.expectDeviceKeyUpload();
@@ -96,7 +101,7 @@ TestClient.prototype.start = function() {
         this.httpBackend.flushAllExpected(),
         testUtils.syncPromise(this.client),
     ]).then(() => {
-        console.log(this + ': started');
+        logger.log(this + ': started');
     });
 };
 
@@ -118,7 +123,7 @@ TestClient.prototype.expectDeviceKeyUpload = function() {
         expect(content.one_time_keys).toBe(undefined);
         expect(content.device_keys).toBeTruthy();
 
-        console.log(self + ': received device keys');
+        logger.log(self + ': received device keys');
         // we expect this to happen before any one-time keys are uploaded.
         expect(Object.keys(self.oneTimeKeys).length).toEqual(0);
 
@@ -155,7 +160,7 @@ TestClient.prototype.awaitOneTimeKeyUpload = function() {
               expect(content.device_keys).toBe(undefined);
               expect(content.one_time_keys).toBeTruthy();
               expect(content.one_time_keys).toNotEqual({});
-              console.log('%s: received %i one-time keys', this,
+              logger.log('%s: received %i one-time keys', this,
                           Object.keys(content.one_time_keys).length);
               this.oneTimeKeys = content.one_time_keys;
               return {one_time_key_counts: {
@@ -181,7 +186,11 @@ TestClient.prototype.expectKeyQuery = function(response) {
     this.httpBackend.when('POST', '/keys/query').respond(
         200, (path, content) => {
             Object.keys(response.device_keys).forEach((userId) => {
-                expect(content.device_keys[userId]).toEqual({});
+                expect(content.device_keys[userId]).toEqual(
+                    {},
+                    "Expected key query for " + userId + ", got " +
+                    Object.keys(content.device_keys),
+                );
             });
             return response;
         });
@@ -215,11 +224,11 @@ TestClient.prototype.getSigningKey = function() {
  * @returns {Promise} promise which completes once the sync has been flushed
  */
 TestClient.prototype.flushSync = function() {
-    console.log(`${this}: flushSync`);
+    logger.log(`${this}: flushSync`);
     return Promise.all([
         this.httpBackend.flush('/sync', 1),
         testUtils.syncPromise(this.client),
     ]).then(() => {
-        console.log(`${this}: flushSync completed`);
+        logger.log(`${this}: flushSync completed`);
     });
 };

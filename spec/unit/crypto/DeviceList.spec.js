@@ -1,6 +1,6 @@
 /*
 Copyright 2017 Vector Creations Ltd
-Copyright 2018 New Vector Ltd
+Copyright 2018, 2019 New Vector Ltd
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,11 +16,10 @@ limitations under the License.
 */
 
 import DeviceList from '../../../lib/crypto/DeviceList';
-import MockStorageApi from '../../MockStorageApi';
-import WebStorageSessionStore from '../../../lib/store/session/webstorage';
 import MemoryCryptoStore from '../../../lib/crypto/store/memory-crypto-store.js';
 import testUtils from '../../test-utils';
 import utils from '../../../lib/utils';
+import logger from '../../../src/logger';
 
 import expect from 'expect';
 import Promise from 'bluebird';
@@ -57,18 +56,15 @@ const signedDeviceList = {
 
 describe('DeviceList', function() {
     let downloadSpy;
-    let sessionStore;
     let cryptoStore;
     let deviceLists = [];
 
     beforeEach(function() {
-        testUtils.beforeEach(this); // eslint-disable-line no-invalid-this
+        testUtils.beforeEach(this); // eslint-disable-line babel/no-invalid-this
 
         deviceLists = [];
 
         downloadSpy = expect.createSpy();
-        const mockStorage = new MockStorageApi();
-        sessionStore = new WebStorageSessionStore(mockStorage);
         cryptoStore = new MemoryCryptoStore();
     });
 
@@ -85,7 +81,7 @@ describe('DeviceList', function() {
         const mockOlm = {
             verifySignature: function(key, message, signature) {},
         };
-        const dl = new DeviceList(baseApis, cryptoStore, sessionStore, mockOlm);
+        const dl = new DeviceList(baseApis, cryptoStore, mockOlm);
         deviceLists.push(dl);
         return dl;
     }
@@ -139,7 +135,7 @@ describe('DeviceList', function() {
         }).then(() => {
             // uh-oh; user restarts before second request completes. The new instance
             // should know we never got a complete device list.
-            console.log("Creating new devicelist to simulate app reload");
+            logger.log("Creating new devicelist to simulate app reload");
             downloadSpy.reset();
             const dl2 = createTestDeviceList();
             const queryDefer3 = Promise.defer();

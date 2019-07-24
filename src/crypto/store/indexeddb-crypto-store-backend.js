@@ -20,7 +20,7 @@ import Promise from 'bluebird';
 import logger from '../../logger';
 import utils from '../../utils';
 
-export const VERSION = 6;
+export const VERSION = 7;
 
 /**
  * Implementation of a CryptoStore which is backed by an existing
@@ -206,6 +206,42 @@ export class Backend {
         return promiseifyTxn(txn).then(() => result);
     }
 
+    getOutgoingRoomKeyRequestsByTarget(userId, deviceId, wantedStates) {
+        let stateIndex = 0;
+        const results = [];
+
+        function onsuccess(ev) {
+            const cursor = ev.target.result;
+            if (cursor) {
+                const keyReq = cursor.value;
+                if (keyReq.recipients.includes({userId, deviceId})) {
+                    results.push(keyReq);
+                }
+                cursor.continue();
+            } else {
+                // try the next state in the list
+                stateIndex++;
+                if (stateIndex >= wantedStates.length) {
+                    // no matches
+                    return;
+                }
+
+                const wantedState = wantedStates[stateIndex];
+                const cursorReq = ev.target.source.openCursor(wantedState);
+                cursorReq.onsuccess = onsuccess;
+            }
+        }
+
+        const txn = this._db.transaction("outgoingRoomKeyRequests", "readonly");
+        const store = txn.objectStore("outgoingRoomKeyRequests");
+
+        const wantedState = wantedStates[stateIndex];
+        const cursorReq = store.index("state").openCursor(wantedState);
+        cursorReq.onsuccess = onsuccess;
+
+        return promiseifyTxn(txn).then(() => results);
+    }
+
     /**
      * Look for an existing room key request by id and state, and update it if
      * found
@@ -314,7 +350,10 @@ export class Backend {
         getReq.onsuccess = function() {
             const cursor = getReq.result;
             if (cursor) {
-                results[cursor.value.sessionId] = cursor.value.session;
+                results[cursor.value.sessionId] = {
+                    session: cursor.value.session,
+                    lastReceivedMessageTs: cursor.value.lastReceivedMessageTs,
+                };
                 cursor.continue();
             } else {
                 try {
@@ -332,7 +371,10 @@ export class Backend {
         getReq.onsuccess = function() {
             try {
                 if (getReq.result) {
-                    func(getReq.result.session);
+                    func({
+                        session: getReq.result.session,
+                        lastReceivedMessageTs: getReq.result.lastReceivedMessageTs,
+                    });
                 } else {
                     func(null);
                 }
@@ -342,9 +384,32 @@ export class Backend {
         };
     }
 
-    storeEndToEndSession(deviceKey, sessionId, session, txn) {
+    getAllEndToEndSessions(txn, func) {
         const objectStore = txn.objectStore("sessions");
-        objectStore.put({deviceKey, sessionId, session});
+        const getReq = objectStore.openCursor();
+        getReq.onsuccess = function() {
+            const cursor = getReq.result;
+            if (cursor) {
+                func(cursor.value);
+                cursor.continue();
+            } else {
+                try {
+                    func(null);
+                } catch (e) {
+                    abortWithException(txn, e);
+                }
+            }
+        };
+    }
+
+    storeEndToEndSession(deviceKey, sessionId, sessionInfo, txn) {
+        const objectStore = txn.objectStore("sessions");
+        objectStore.put({
+            deviceKey,
+            sessionId,
+            session: sessionInfo.session,
+            lastReceivedMessageTs: sessionInfo.lastReceivedMessageTs,
+        });
     }
 
     // Inbound group sessions
@@ -462,6 +527,85 @@ export class Backend {
         };
     }
 
+    // session backups
+
+    getSessionsNeedingBackup(limit) {
+        return new Promise((resolve, reject) => {
+            const sessions = [];
+
+            const txn = this._db.transaction(
+                ["sessions_needing_backup", "inbound_group_sessions"],
+                "readonly",
+            );
+            txn.onerror = reject;
+            txn.oncomplete = function() {
+                resolve(sessions);
+            };
+            const objectStore = txn.objectStore("sessions_needing_backup");
+            const sessionStore = txn.objectStore("inbound_group_sessions");
+            const getReq = objectStore.openCursor();
+            getReq.onsuccess = function() {
+                const cursor = getReq.result;
+                if (cursor) {
+                    const sessionGetReq = sessionStore.get(cursor.key);
+                    sessionGetReq.onsuccess = function() {
+                        sessions.push({
+                            senderKey: sessionGetReq.result.senderCurve25519Key,
+                            sessionId: sessionGetReq.result.sessionId,
+                            sessionData: sessionGetReq.result.session,
+                        });
+                    };
+                    if (!limit || sessions.length < limit) {
+                        cursor.continue();
+                    }
+                }
+            };
+        });
+    }
+
+    countSessionsNeedingBackup(txn) {
+        if (!txn) {
+            txn = this._db.transaction("sessions_needing_backup", "readonly");
+        }
+        const objectStore = txn.objectStore("sessions_needing_backup");
+        return new Promise((resolve, reject) => {
+            const req = objectStore.count();
+            req.onerror = reject;
+            req.onsuccess = () => resolve(req.result);
+        });
+    }
+
+    unmarkSessionsNeedingBackup(sessions, txn) {
+        if (!txn) {
+            txn = this._db.transaction("sessions_needing_backup", "readwrite");
+        }
+        const objectStore = txn.objectStore("sessions_needing_backup");
+        return Promise.all(sessions.map((session) => {
+            return new Promise((resolve, reject) => {
+                const req = objectStore.delete([session.senderKey, session.sessionId]);
+                req.onsuccess = resolve;
+                req.onerror = reject;
+            });
+        }));
+    }
+
+    markSessionsNeedingBackup(sessions, txn) {
+        if (!txn) {
+            txn = this._db.transaction("sessions_needing_backup", "readwrite");
+        }
+        const objectStore = txn.objectStore("sessions_needing_backup");
+        return Promise.all(sessions.map((session) => {
+            return new Promise((resolve, reject) => {
+                const req = objectStore.put({
+                    senderCurve25519Key: session.senderKey,
+                    sessionId: session.sessionId,
+                });
+                req.onsuccess = resolve;
+                req.onerror = reject;
+            });
+        }));
+    }
+
     doTxn(mode, stores, func) {
         const txn = this._db.transaction(stores, mode);
         const promise = promiseifyTxn(txn);
@@ -499,6 +643,11 @@ export function upgradeDatabase(db, oldVersion) {
     }
     if (oldVersion < 6) {
         db.createObjectStore("rooms");
+    }
+    if (oldVersion < 7) {
+        db.createObjectStore("sessions_needing_backup", {
+            keyPath: ["senderCurve25519Key", "sessionId"],
+        });
     }
     // Expand as needed.
 }
@@ -541,12 +690,21 @@ function promiseifyTxn(txn) {
             }
             resolve();
         };
-        txn.onerror = () => {
+        txn.onerror = (event) => {
             if (txn._mx_abortexception !== undefined) {
                 reject(txn._mx_abortexception);
+            } else {
+                logger.log("Error performing indexeddb txn", event);
+                reject(event.target.error);
             }
-            reject();
         };
-        txn.onabort = () => reject(txn._mx_abortexception);
+        txn.onabort = (event) => {
+            if (txn._mx_abortexception !== undefined) {
+                reject(txn._mx_abortexception);
+            } else {
+                logger.log("Error performing indexeddb txn", event);
+                reject(event.target.error);
+            }
+        };
     });
 }

@@ -23,8 +23,8 @@ limitations under the License.
  */
 
 import Promise from 'bluebird';
+import logger from '../../../src/logger';
 
-const logger = require("../../logger");
 const utils = require("../../utils");
 const olmlib = require("../olmlib");
 const base = require("./base");
@@ -144,6 +144,11 @@ function MegolmEncryption(params) {
     // room).
     this._setupPromise = Promise.resolve();
 
+    // Map of outbound sessions by sessions ID. Used if we need a particular
+    // session (the session we're currently using to send is always obtained
+    // using _setupPromise).
+    this._outboundSessions = {};
+
     // default rotation periods
     this._sessionRotationPeriodMsgs = 100;
     this._sessionRotationPeriodMs = 7 * 24 * 3600 * 1000;
@@ -195,6 +200,7 @@ MegolmEncryption.prototype._ensureOutboundSession = function(devicesInRoom) {
         if (!session) {
             logger.log(`Starting new megolm session for room ${self._roomId}`);
             session = await self._prepareNewSession();
+            self._outboundSessions[session.sessionId] = session;
         }
 
         // now check if we need to share with any devices
@@ -263,6 +269,18 @@ MegolmEncryption.prototype._prepareNewSession = async function() {
         this._roomId, this._olmDevice.deviceCurve25519Key, [], sessionId,
         key.key, {ed25519: this._olmDevice.deviceEd25519Key},
     );
+
+    if (this._crypto.backupInfo) {
+        // don't wait for it to complete
+        this._crypto.backupGroupSession(
+            this._roomId, this._olmDevice.deviceCurve25519Key, [],
+            sessionId, key.key,
+        ).catch((e) => {
+            // This throws if the upload failed, but this is fine
+            // since it will have written it to the db and will retry.
+            logger.log("Failed to back up group session", e);
+        });
+    }
 
     return new OutboundSessionInfo(sessionId);
 };
@@ -409,8 +427,98 @@ MegolmEncryption.prototype._encryptAndSendKeysToDevices = function(
 };
 
 /**
- * @private
+ * Re-shares a megolm session key with devices if the key has already been
+ * sent to them.
  *
+ * @param {string} senderKey The key of the originating device for the session
+ * @param {string} sessionId ID of the outbound session to share
+ * @param {string} userId ID of the user who owns the target device
+ * @param {module:crypto/deviceinfo} device The target device
+ */
+MegolmEncryption.prototype.reshareKeyWithDevice = async function(
+    senderKey, sessionId, userId, device,
+) {
+    const obSessionInfo = this._outboundSessions[sessionId];
+    if (!obSessionInfo) {
+        logger.debug("Session ID " + sessionId + " not found: not re-sharing keys");
+        return;
+    }
+
+    // The chain index of the key we previously sent this device
+    if (obSessionInfo.sharedWithDevices[userId] === undefined) {
+        logger.debug("Session ID " + sessionId + " never shared with user " + userId);
+        return;
+    }
+    const sentChainIndex = obSessionInfo.sharedWithDevices[userId][device.deviceId];
+    if (sentChainIndex === undefined) {
+        logger.debug(
+            "Session ID " + sessionId + " never shared with device " +
+            userId + ":" + device.deviceId,
+        );
+        return;
+    }
+
+    // get the key from the inbound session: the outbound one will already
+    // have been ratcheted to the next chain index.
+    const key = await this._olmDevice.getInboundGroupSessionKey(
+        this._roomId, senderKey, sessionId, sentChainIndex,
+    );
+
+    if (!key) {
+        logger.warn(
+            "No outbound session key found for " + sessionId + ": not re-sharing keys",
+        );
+        return;
+    }
+
+    await olmlib.ensureOlmSessionsForDevices(
+        this._olmDevice, this._baseApis, {
+            [userId]: {
+                [device.deviceId]: device,
+            },
+        },
+    );
+
+    const payload = {
+        type: "m.forwarded_room_key",
+        content: {
+            algorithm: olmlib.MEGOLM_ALGORITHM,
+            room_id: this._roomId,
+            session_id: sessionId,
+            session_key: key.key,
+            chain_index: key.chain_index,
+            sender_key: senderKey,
+            sender_claimed_ed25519_key: key.sender_claimed_ed25519_key,
+            forwarding_curve25519_key_chain: key.forwarding_curve25519_key_chain,
+        },
+    };
+
+    const encryptedContent = {
+        algorithm: olmlib.OLM_ALGORITHM,
+        sender_key: this._olmDevice.deviceCurve25519Key,
+        ciphertext: {},
+    };
+    await olmlib.encryptMessageForDevice(
+        encryptedContent.ciphertext,
+        this._userId,
+        this._deviceId,
+        this._olmDevice,
+        userId,
+        device,
+        payload,
+    ),
+
+    await this._baseApis.sendToDevice("m.room.encrypted", {
+        [userId]: {
+            [device.deviceId]: encryptedContent,
+        },
+    });
+    logger.debug(
+        `Re-shared key for session ${sessionId}  with ${userId}:${device.deviceId}`,
+    );
+};
+
+/**
  * @param {module:crypto/algorithms/megolm.OutboundSessionInfo} session
  *
  * @param {object<string, module:crypto/deviceinfo[]>} devicesByUser
@@ -650,7 +758,7 @@ MegolmDecryption.prototype.decryptEvent = async function(event) {
     } catch (e) {
         let errorCode = "OLM_DECRYPT_GROUP_MESSAGE_ERROR";
 
-        if (e.message === 'OLM.UNKNOWN_MESSAGE_INDEX') {
+        if (e && e.message === 'OLM.UNKNOWN_MESSAGE_INDEX') {
             this._requestKeysForEvent(event);
 
             errorCode = 'OLM_UNKNOWN_MESSAGE_INDEX';
@@ -658,7 +766,7 @@ MegolmDecryption.prototype.decryptEvent = async function(event) {
 
         throw new base.DecryptionError(
             errorCode,
-            e.toString(), {
+            e ? e.toString() : "Unknown Error: Error is undefined", {
                 session: content.sender_key + '|' + content.session_id,
             },
         );
@@ -707,19 +815,9 @@ MegolmDecryption.prototype.decryptEvent = async function(event) {
 };
 
 MegolmDecryption.prototype._requestKeysForEvent = function(event) {
-    const sender = event.getSender();
     const wireContent = event.getWireContent();
 
-    // send the request to all of our own devices, and the
-    // original sending device if it wasn't us.
-    const recipients = [{
-        userId: this._userId, deviceId: '*',
-    }];
-    if (sender != this._userId) {
-        recipients.push({
-            userId: sender, deviceId: wireContent.device_id,
-        });
-    }
+    const recipients = event.getKeyRequestRecipients(this._userId);
 
     this._crypto.requestRoomKey({
         room_id: event.getRoomId(),
@@ -825,21 +923,41 @@ MegolmDecryption.prototype.onRoomKeyEvent = function(event) {
     }
 
     logger.log(`Adding key for megolm session ${senderKey}|${sessionId}`);
-    this._olmDevice.addInboundGroupSession(
+    return this._olmDevice.addInboundGroupSession(
         content.room_id, senderKey, forwardingKeyChain, sessionId,
         content.session_key, keysClaimed,
         exportFormat,
     ).then(() => {
-        // cancel any outstanding room key requests for this session
-        this._crypto.cancelRoomKeyRequest({
-            algorithm: content.algorithm,
-            room_id: content.room_id,
-            session_id: content.session_id,
-            sender_key: senderKey,
-        });
-
         // have another go at decrypting events sent with this session.
-        this._retryDecryption(senderKey, sessionId);
+        this._retryDecryption(senderKey, sessionId)
+            .then((success) => {
+                // cancel any outstanding room key requests for this session.
+                // Only do this if we managed to decrypt every message in the
+                // session, because if we didn't, we leave the other key
+                // requests in the hopes that someone sends us a key that
+                // includes an earlier index.
+                if (success) {
+                    this._crypto.cancelRoomKeyRequest({
+                        algorithm: content.algorithm,
+                        room_id: content.room_id,
+                        session_id: content.session_id,
+                        sender_key: senderKey,
+                    });
+                }
+            });
+    }).then(() => {
+        if (this._crypto.backupInfo) {
+            // don't wait for the keys to be backed up for the server
+            this._crypto.backupGroupSession(
+                content.room_id, senderKey, forwardingKeyChain,
+                content.session_id, content.session_key, keysClaimed,
+                exportFormat,
+            ).catch((e) => {
+                // This throws if the upload failed, but this is fine
+                // since it will have written it to the db and will retry.
+                logger.log("Failed to back up group session", e);
+            });
+        }
     }).catch((e) => {
         logger.error(`Error handling m.room_key_event: ${e}`);
     });
@@ -957,6 +1075,22 @@ MegolmDecryption.prototype.importRoomKey = function(session) {
         session.sender_claimed_keys,
         true,
     ).then(() => {
+        if (this._crypto.backupInfo) {
+            // don't wait for it to complete
+            this._crypto.backupGroupSession(
+                session.room_id,
+                session.sender_key,
+                session.forwarding_curve25519_key_chain,
+                session.session_id,
+                session.session_key,
+                session.sender_claimed_keys,
+                true,
+            ).catch((e) => {
+                // This throws if the upload failed, but this is fine
+                // since it will have written it to the db and will retry.
+                logger.log("Failed to back up group session", e);
+            });
+        }
         // have another go at decrypting events sent with this session.
         this._retryDecryption(session.sender_key, session.session_id);
     });
@@ -968,19 +1102,27 @@ MegolmDecryption.prototype.importRoomKey = function(session) {
  * @private
  * @param {String} senderKey
  * @param {String} sessionId
+ *
+ * @return {Boolean} whether all messages were successfully decrypted
  */
-MegolmDecryption.prototype._retryDecryption = function(senderKey, sessionId) {
+MegolmDecryption.prototype._retryDecryption = async function(senderKey, sessionId) {
     const k = senderKey + "|" + sessionId;
     const pending = this._pendingEvents[k];
     if (!pending) {
-        return;
+        return true;
     }
 
     delete this._pendingEvents[k];
 
-    for (const ev of pending) {
-        ev.attemptDecryption(this._crypto);
-    }
+    await Promise.all([...pending].map(async (ev) => {
+        try {
+            await ev.attemptDecryption(this._crypto);
+        } catch (e) {
+            // don't die if something goes wrong
+        }
+    }));
+
+    return !this._pendingEvents[k];
 };
 
 base.registerAlgorithm(

@@ -14,7 +14,7 @@ describe("RoomMember", function() {
     let member;
 
     beforeEach(function() {
-        utils.beforeEach(this); // eslint-disable-line no-invalid-this
+        utils.beforeEach(this); // eslint-disable-line babel/no-invalid-this
         member = new RoomMember(roomId, userA);
     });
 
@@ -284,6 +284,53 @@ describe("RoomMember", function() {
             expect(emitCount).toEqual(1);
             member.setMembershipEvent(joinEvent); // no-op
             expect(emitCount).toEqual(1);
+        });
+
+        it("should set 'name' to user_id if it is just whitespace", function() {
+            const joinEvent = utils.mkMembership({
+                event: true,
+                mship: "join",
+                user: userA,
+                room: roomId,
+                name: " \u200b ",
+            });
+
+            expect(member.name).toEqual(userA); // default = user_id
+            member.setMembershipEvent(joinEvent);
+            expect(member.name).toEqual(userA); // it should fallback because all whitespace
+        });
+
+        it("should disambiguate users on a fuzzy displayname match", function() {
+            const joinEvent = utils.mkMembership({
+                event: true,
+                mship: "join",
+                user: userA,
+                room: roomId,
+                name: "Alíce\u200b", // note diacritic and zero width char
+            });
+
+            const roomState = {
+                getStateEvents: function(type) {
+                    if (type !== "m.room.member") {
+                        return [];
+                    }
+                    return [
+                        utils.mkMembership({
+                            event: true, mship: "join", room: roomId,
+                            user: userC, name: "Alice",
+                        }),
+                        joinEvent,
+                    ];
+                },
+                getUserIdsWithDisplayName: function(displayName) {
+                    return [userA, userC];
+                },
+            };
+            expect(member.name).toEqual(userA); // default = user_id
+            member.setMembershipEvent(joinEvent, roomState);
+            expect(member.name).toNotEqual("Alíce"); // it should disambig.
+            // user_id should be there somewhere
+            expect(member.name.indexOf(userA)).toNotEqual(-1);
         });
     });
 });

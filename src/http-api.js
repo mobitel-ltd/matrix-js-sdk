@@ -22,6 +22,7 @@ import Promise from 'bluebird';
 const parseContentType = require('content-type').parse;
 
 const utils = require("./utils");
+import logger from '../src/logger';
 
 // we use our own implementation of setTimeout, so that if we get suspended in
 // the middle of a /sync, we cancel the sync as soon as we awake, rather than
@@ -101,7 +102,7 @@ module.exports.MatrixHttpApi.prototype = {
         };
         return {
             base: this.opts.baseUrl,
-            path: "/_matrix/media/v1/upload",
+            path: "/_matrix/media/r0/upload",
             params: params,
         };
     },
@@ -164,9 +165,21 @@ module.exports.MatrixHttpApi.prototype = {
         const contentType = opts.type || file.type || 'application/octet-stream';
         const fileName = opts.name || file.name;
 
-        // we used to recommend setting file.stream to the thing to upload on
-        // nodejs.
-        const body = file.stream ? file.stream : file;
+        // We used to recommend setting file.stream to the thing to upload on
+        // Node.js. As of 2019-06-11, this is still in widespread use in various
+        // clients, so we should preserve this for simple objects used in
+        // Node.js. File API objects (via either the File or Blob interfaces) in
+        // the browser now define a `stream` method, which leads to trouble
+        // here, so we also check the type of `stream`.
+        let body = file;
+        if (body.stream && typeof body.stream !== "function") {
+            logger.warn(
+                "Using `file.stream` as the content to upload. Future " +
+                "versions of the js-sdk will change this to expect `file` to " +
+                "be the content directly.",
+            );
+            body = body.stream;
+        }
 
         // backwards-compatibility hacks where we used to do different things
         // between browser and node.
@@ -175,7 +188,7 @@ module.exports.MatrixHttpApi.prototype = {
             if (global.XMLHttpRequest) {
                 rawResponse = false;
             } else {
-                console.warn(
+                logger.warn(
                     "Returning the raw JSON from uploadContent(). Future " +
                     "versions of the js-sdk will change this default, to " +
                     "return the parsed object. Set opts.rawResponse=false " +
@@ -188,7 +201,7 @@ module.exports.MatrixHttpApi.prototype = {
         let onlyContentUri = opts.onlyContentUri;
         if (!rawResponse && onlyContentUri === undefined) {
             if (global.XMLHttpRequest) {
-                console.warn(
+                logger.warn(
                     "Returning only the content-uri from uploadContent(). " +
                     "Future versions of the js-sdk will change this " +
                     "default, to return the whole response object. Set " +
@@ -278,7 +291,7 @@ module.exports.MatrixHttpApi.prototype = {
                     });
                 }
             });
-            let url = this.opts.baseUrl + "/_matrix/media/v1/upload";
+            let url = this.opts.baseUrl + "/_matrix/media/r0/upload";
 
             const queryArgs = [];
 
@@ -314,7 +327,7 @@ module.exports.MatrixHttpApi.prototype = {
 
             promise = this.authedRequest(
                 opts.callback, "POST", "/upload", queryParams, body, {
-                    prefix: "/_matrix/media/v1",
+                    prefix: "/_matrix/media/r0",
                     headers: {"Content-Type": contentType},
                     json: false,
                     bodyParser: bodyParser,
@@ -457,7 +470,7 @@ module.exports.MatrixHttpApi.prototype = {
         const self = this;
         requestPromise.catch(function(err) {
             if (err.errcode == 'M_UNKNOWN_TOKEN') {
-                self.event_emitter.emit("Session.logged_out");
+                self.event_emitter.emit("Session.logged_out", err);
             } else if (err.errcode == 'M_CONSENT_NOT_GIVEN') {
                 self.event_emitter.emit(
                     "no_consent",

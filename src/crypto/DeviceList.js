@@ -1,6 +1,6 @@
 /*
 Copyright 2017 Vector Creations Ltd
-Copyright 2018 New Vector Ltd
+Copyright 2018, 2019 New Vector Ltd
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -61,9 +61,8 @@ const TRACKING_STATUS_UP_TO_DATE = 3;
  * @alias module:crypto/DeviceList
  */
 export default class DeviceList {
-    constructor(baseApis, cryptoStore, sessionStore, olmDevice) {
+    constructor(baseApis, cryptoStore, olmDevice) {
         this._cryptoStore = cryptoStore;
-        this._sessionStore = sessionStore;
 
         // userId -> {
         //     deviceId -> {
@@ -71,6 +70,9 @@ export default class DeviceList {
         //     }
         // }
         this._devices = {};
+
+        // map of identity keys to the user who owns it
+        this._userByIdentityKey = {};
 
         // which users we are tracking device status for.
         // userId -> TRACKING_STATUS_*
@@ -105,38 +107,26 @@ export default class DeviceList {
      * Load the device tracking state from storage
      */
     async load() {
-        let shouldDeleteSessionStore = false;
         await this._cryptoStore.doTxn(
-            // migrate from session store if there's data there and not here
-            'readwrite', [IndexedDBCryptoStore.STORE_DEVICE_DATA], (txn) => {
+            'readonly', [IndexedDBCryptoStore.STORE_DEVICE_DATA], (txn) => {
                 this._cryptoStore.getEndToEndDeviceData(txn, (deviceData) => {
-                    if (deviceData === null) {
-                        logger.log("Migrating e2e device data...");
-                        this._devices = this._sessionStore.getAllEndToEndDevices() || {};
-                        this._deviceTrackingStatus = (
-                            this._sessionStore.getEndToEndDeviceTrackingStatus() || {}
-                        );
-                        this._syncToken = this._sessionStore.getEndToEndDeviceSyncToken();
-                        this._cryptoStore.storeEndToEndDeviceData({
-                            devices: this._devices,
-                            trackingStatus: this._deviceTrackingStatus,
-                            syncToken: this._syncToken,
-                        }, txn);
-                        shouldDeleteSessionStore = true;
-                    } else {
-                        this._devices = deviceData ? deviceData.devices : {},
-                        this._deviceTrackingStatus = deviceData ?
-                            deviceData.trackingStatus : {};
-                        this._syncToken = deviceData ? deviceData.syncToken : null;
+                    this._devices = deviceData ? deviceData.devices : {},
+                    this._deviceTrackingStatus = deviceData ?
+                        deviceData.trackingStatus : {};
+                    this._syncToken = deviceData ? deviceData.syncToken : null;
+                    this._userByIdentityKey = {};
+                    for (const user of Object.keys(this._devices)) {
+                        const userDevices = this._devices[user];
+                        for (const device of Object.keys(userDevices)) {
+                            const idKey = userDevices[device].keys['curve25519:'+device];
+                            if (idKey !== undefined) {
+                                this._userByIdentityKey[idKey] = user;
+                            }
+                        }
                     }
                 });
             },
         );
-
-        if (shouldDeleteSessionStore) {
-            // migrated data is now safely persisted: remove from old store
-            this._sessionStore.removeEndToEndDeviceData();
-        }
 
         for (const u of Object.keys(this._deviceTrackingStatus)) {
             // if a download was in progress when we got shut down, it isn't any more.
@@ -364,13 +354,17 @@ export default class DeviceList {
     /**
      * Find a device by curve25519 identity key
      *
-     * @param {string} userId     owner of the device
      * @param {string} algorithm  encryption algorithm
      * @param {string} senderKey  curve25519 key to match
      *
      * @return {module:crypto/deviceinfo?}
      */
-    getDeviceByIdentityKey(userId, algorithm, senderKey) {
+    getDeviceByIdentityKey(algorithm, senderKey) {
+        const userId = this._userByIdentityKey[senderKey];
+        if (!userId) {
+            return null;
+        }
+
         if (
             algorithm !== olmlib.OLM_ALGORITHM &&
             algorithm !== olmlib.MEGOLM_ALGORITHM
@@ -415,7 +409,23 @@ export default class DeviceList {
      * @param {Object} devs New device info for user
      */
     storeDevicesForUser(u, devs) {
+        // remove previous devices from _userByIdentityKey
+        if (this._devices[u] !== undefined) {
+            for (const [deviceId, dev] of Object.entries(this._devices[u])) {
+                const identityKey = dev.keys['curve25519:'+deviceId];
+
+                delete this._userByIdentityKey[identityKey];
+            }
+        }
+
         this._devices[u] = devs;
+
+        // add new ones
+        for (const [deviceId, dev] of Object.entries(devs)) {
+            const identityKey = dev.keys['curve25519:'+deviceId];
+
+            this._userByIdentityKey[identityKey] = u;
+        }
         this._dirty = true;
     }
 
@@ -442,10 +452,10 @@ export default class DeviceList {
         if (!this._deviceTrackingStatus[userId]) {
             logger.log('Now tracking device list for ' + userId);
             this._deviceTrackingStatus[userId] = TRACKING_STATUS_PENDING_DOWNLOAD;
+            // we don't yet persist the tracking status, since there may be a lot
+            // of calls; we save all data together once the sync is done
+            this._dirty = true;
         }
-        // we don't yet persist the tracking status, since there may be a lot
-        // of calls; we save all data together once the sync is done
-        this._dirty = true;
     }
 
     /**
@@ -532,7 +542,23 @@ export default class DeviceList {
      * @param {Object} devices deviceId->{object} the new devices
      */
     _setRawStoredDevicesForUser(userId, devices) {
+        // remove old devices from _userByIdentityKey
+        if (this._devices[userId] !== undefined) {
+            for (const [deviceId, dev] of Object.entries(this._devices[userId])) {
+                const identityKey = dev.keys['curve25519:'+deviceId];
+
+                delete this._userByIdentityKey[identityKey];
+            }
+        }
+
         this._devices[userId] = devices;
+
+        // add new devices into _userByIdentityKey
+        for (const [deviceId, dev] of Object.entries(devices)) {
+            const identityKey = dev.keys['curve25519:'+deviceId];
+
+            this._userByIdentityKey[identityKey] = userId;
+        }
     }
 
     /**

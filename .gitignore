@@ -2,6 +2,9 @@
 /.jsdoc
 
 node_modules
+/.npmrc
+/*.log
+package-lock.json
 .lock-wscript
 build/Release
 coverage
@@ -11,6 +14,6 @@ reports
 /dist
 /specbuild
 
-# version file and tarball created by 'npm pack'
+# version file and tarball created by `npm pack` / `yarn pack`
 /git-revision.txt
 /matrix-js-sdk-*.tgz

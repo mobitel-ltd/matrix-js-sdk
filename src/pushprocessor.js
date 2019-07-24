@@ -14,11 +14,61 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
+import {escapeRegExp, globToRegexp} from "./utils";
+
 /**
  * @module pushprocessor
  */
 
 const RULEKINDS_IN_ORDER = ['override', 'content', 'room', 'sender', 'underride'];
+
+// The default override rules to apply when calculating actions for an event. These
+// defaults apply under no other circumstances to avoid confusing the client with server
+// state. We do this for two reasons:
+//   1. Synapse is unlikely to send us the push rule in an incremental sync - see
+//      https://github.com/matrix-org/synapse/pull/4867#issuecomment-481446072 for
+//      more details.
+//   2. We often want to start using push rules ahead of the server supporting them,
+//      and so we can put them here.
+const DEFAULT_OVERRIDE_RULES = [
+    {
+        // For homeservers which don't support MSC1930 yet
+        rule_id: ".m.rule.tombstone",
+        default: true,
+        enabled: true,
+        conditions: [
+            {
+                kind: "event_match",
+                key: "type",
+                pattern: "m.room.tombstone",
+            },
+        ],
+        actions: [
+            "notify",
+            {
+                set_tweak: "highlight",
+                value: true,
+            },
+        ],
+    },
+    {
+        // For homeservers which don't support MSC2153 yet
+        rule_id: ".m.rule.reaction",
+        default: true,
+        enabled: true,
+        conditions: [
+            {
+                kind: "event_match",
+                key: "type",
+                pattern: "m.reaction",
+            },
+        ],
+        actions: [
+            "dont_notify",
+        ],
+    },
+];
 
 /**
  * Construct a Push Processor.
@@ -26,10 +76,6 @@ const RULEKINDS_IN_ORDER = ['override', 'content', 'room', 'sender', 'underride'
  * @param {Object} client The Matrix client object to use
  */
 function PushProcessor(client) {
-    const escapeRegExp = function(string) {
-        return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    };
-
     const cachedGlobToRegex = {
         // $glob: RegExp,
     };
@@ -185,7 +231,10 @@ function PushProcessor(client) {
     };
 
     const eventFulfillsDisplayNameCondition = function(cond, ev) {
-        const content = ev.getContent();
+        let content = ev.getContent();
+        if (ev.isEncrypted() && ev.getClearContent()) {
+            content = ev.getClearContent();
+        }
         if (!content || !content.body || typeof content.body != 'string') {
             return false;
         }
@@ -242,22 +291,6 @@ function PushProcessor(client) {
             'i', // Case insensitive
         );
         return cachedGlobToRegex[glob];
-    };
-
-    const globToRegexp = function(glob) {
-        // From
-        // https://github.com/matrix-org/synapse/blob/abbee6b29be80a77e05730707602f3bbfc3f38cb/synapse/push/__init__.py#L132
-        // Because micromatch is about 130KB with dependencies,
-        // and minimatch is not much better.
-        let pat = escapeRegExp(glob);
-        pat = pat.replace(/\\\*/g, '.*');
-        pat = pat.replace(/\?/g, '.');
-        pat = pat.replace(/\\\[(!|)(.*)\\]/g, function(match, p1, p2, offset, string) {
-            const first = p1 && '^' || '';
-            const second = p2.replace(/\\\-/, '-');
-            return '[' + first + second + ']';
-        });
-        return pat;
     };
 
     const valueForDottedKey = function(key, ev) {
@@ -326,6 +359,33 @@ function PushProcessor(client) {
         return actionObj;
     };
 
+    const applyRuleDefaults = function(clientRuleset) {
+        // Deep clone the object before we mutate it
+        const ruleset = JSON.parse(JSON.stringify(clientRuleset));
+
+        if (!clientRuleset['global']) {
+            clientRuleset['global'] = {};
+        }
+        if (!clientRuleset['global']['override']) {
+            clientRuleset['global']['override'] = [];
+        }
+
+        // Apply default overrides
+        const globalOverrides = clientRuleset['global']['override'];
+        for (const override of DEFAULT_OVERRIDE_RULES) {
+            const existingRule = globalOverrides
+                .find((r) => r.rule_id === override.rule_id);
+
+            if (!existingRule) {
+                const ruleId = override.rule_id;
+                console.warn(`Adding default global override for ${ruleId}`);
+                globalOverrides.push(override);
+            }
+        }
+
+        return ruleset;
+    };
+
     this.ruleMatchesEvent = function(rule, ev) {
         let ret = true;
         for (let i = 0; i < rule.conditions.length; ++i) {
@@ -345,7 +405,8 @@ function PushProcessor(client) {
      * @return {PushAction}
      */
     this.actionsForEvent = function(ev) {
-        return pushActionsForEventAndRulesets(ev, client.pushRules);
+        const rules = applyRuleDefaults(client.pushRules);
+        return pushActionsForEventAndRulesets(ev, rules);
     };
 
     /**

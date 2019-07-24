@@ -1,5 +1,6 @@
 /*
 Copyright 2016 OpenMarket Ltd
+Copyright 2019 New Vector Ltd
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,7 +24,7 @@ limitations under the License.
 import Promise from 'bluebird';
 const anotherjson = require('another-json');
 
-const logger = require("../logger");
+import logger from '../logger';
 const utils = require("../utils");
 
 /**
@@ -35,6 +36,11 @@ module.exports.OLM_ALGORITHM = "m.olm.v1.curve25519-aes-sha2";
  * matrix algorithm tag for megolm
  */
 module.exports.MEGOLM_ALGORITHM = "m.megolm.v1.aes-sha2";
+
+/**
+ * matrix algorithm tag for megolm backups
+ */
+module.exports.MEGOLM_BACKUP_ALGORITHM = "m.megolm_backup.v1.curve25519-aes-sha2";
 
 
 /**
@@ -116,19 +122,23 @@ module.exports.encryptMessageForDevice = async function(
  * @param {module:base-apis~MatrixBaseApis} baseApis
  *
  * @param {object<string, module:crypto/deviceinfo[]>} devicesByUser
- *    map from userid to list of devices
+ *    map from userid to list of devices to ensure sessions for
+ *
+ * @param {bolean} force If true, establish a new session even if one already exists.
+ *     Optional.
  *
  * @return {module:client.Promise} resolves once the sessions are complete, to
  *    an Object mapping from userId to deviceId to
  *    {@link module:crypto~OlmSessionResult}
  */
 module.exports.ensureOlmSessionsForDevices = async function(
-    olmDevice, baseApis, devicesByUser,
+    olmDevice, baseApis, devicesByUser, force,
 ) {
     const devicesWithoutSession = [
         // [userId, deviceId], ...
     ];
     const result = {};
+    const resolveSession = {};
 
     for (const userId in devicesByUser) {
         if (!devicesByUser.hasOwnProperty(userId)) {
@@ -140,8 +150,37 @@ module.exports.ensureOlmSessionsForDevices = async function(
             const deviceInfo = devices[j];
             const deviceId = deviceInfo.deviceId;
             const key = deviceInfo.getIdentityKey();
-            const sessionId = await olmDevice.getSessionIdForDevice(key);
-            if (sessionId === null) {
+            if (!olmDevice._sessionsInProgress[key]) {
+                // pre-emptively mark the session as in-progress to avoid race
+                // conditions.  If we find that we already have a session, then
+                // we'll resolve
+                olmDevice._sessionsInProgress[key] = new Promise(
+                    (resolve, reject) => {
+                        resolveSession[key] = {
+                            resolve: (...args) => {
+                                delete olmDevice._sessionsInProgress[key];
+                                resolve(...args);
+                            },
+                            reject: (...args) => {
+                                delete olmDevice._sessionsInProgress[key];
+                                reject(...args);
+                            },
+                        };
+                    },
+                );
+            }
+            const sessionId = await olmDevice.getSessionIdForDevice(
+                key, resolveSession[key],
+            );
+            if (sessionId !== null && resolveSession[key]) {
+                // we found a session, but we had marked the session as
+                // in-progress, so unmark it and unblock anything that was
+                // waiting
+                delete olmDevice._sessionsInProgress[key];
+                resolveSession[key].resolve();
+                delete resolveSession[key];
+            }
+            if (sessionId === null || force) {
                 devicesWithoutSession.push([userId, deviceId]);
             }
             result[userId][deviceId] = {
@@ -155,16 +194,19 @@ module.exports.ensureOlmSessionsForDevices = async function(
         return result;
     }
 
-    // TODO: this has a race condition - if we try to send another message
-    // while we are claiming a key, we will end up claiming two and setting up
-    // two sessions.
-    //
-    // That should eventually resolve itself, but it's poor form.
-
     const oneTimeKeyAlgorithm = "signed_curve25519";
-    const res = await baseApis.claimOneTimeKeys(
-        devicesWithoutSession, oneTimeKeyAlgorithm,
-    );
+    let res;
+    try {
+        res = await baseApis.claimOneTimeKeys(
+            devicesWithoutSession, oneTimeKeyAlgorithm,
+        );
+    } catch (e) {
+        for (const resolver of Object.values(resolveSession)) {
+            resolver.resolve();
+        }
+        logger.log("failed to claim one-time keys", e, devicesWithoutSession);
+        throw e;
+    }
 
     const otk_res = res.one_time_keys || {};
     const promises = [];
@@ -177,7 +219,8 @@ module.exports.ensureOlmSessionsForDevices = async function(
         for (let j = 0; j < devices.length; j++) {
             const deviceInfo = devices[j];
             const deviceId = deviceInfo.deviceId;
-            if (result[userId][deviceId].sessionId) {
+            const key = deviceInfo.getIdentityKey();
+            if (result[userId][deviceId].sessionId && !force) {
                 // we already have a result for this device
                 continue;
             }
@@ -191,10 +234,12 @@ module.exports.ensureOlmSessionsForDevices = async function(
             }
 
             if (!oneTimeKey) {
-                logger.warn(
-                    "No one-time keys (alg=" + oneTimeKeyAlgorithm +
-                        ") for device " + userId + ":" + deviceId,
-                );
+                const msg = "No one-time keys (alg=" + oneTimeKeyAlgorithm +
+                      ") for device " + userId + ":" + deviceId;
+                logger.warn(msg);
+                if (resolveSession[key]) {
+                    resolveSession[key].resolve();
+                }
                 continue;
             }
 
@@ -202,7 +247,15 @@ module.exports.ensureOlmSessionsForDevices = async function(
                 _verifyKeyAndStartSession(
                     olmDevice, oneTimeKey, userId, deviceInfo,
                 ).then((sid) => {
+                    if (resolveSession[key]) {
+                        resolveSession[key].resolve(sid);
+                    }
                     result[userId][deviceId].sessionId = sid;
+                }, (e) => {
+                    if (resolveSession[key]) {
+                        resolveSession[key].resolve();
+                    }
+                    throw e;
                 }),
             );
         }

@@ -1,6 +1,7 @@
 /*
 Copyright 2015, 2016 OpenMarket Ltd
-Copyright 2018 New Vector Ltd
+Copyright 2018, 2019 New Vector Ltd
+Copyright 2019 The Matrix.org Foundation C.I.C.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,9 +30,17 @@ const ContentRepo = require("../content-repo");
 const EventTimeline = require("./event-timeline");
 const EventTimelineSet = require("./event-timeline-set");
 
+import logger from '../../src/logger';
 import ReEmitter from '../ReEmitter';
 
-const LATEST_ROOM_VERSION = '1';
+// These constants are used as sane defaults when the homeserver doesn't support
+// the m.room_versions capability. In practice, KNOWN_SAFE_ROOM_VERSION should be
+// the same as the common default room version whereas SAFE_ROOM_VERSIONS are the
+// room versions which are considered okay for people to run without being asked
+// to upgrade (ie: "stable"). Eventually, we should remove these when all homeservers
+// return an m.room_versions capability.
+const KNOWN_SAFE_ROOM_VERSION = '4';
+const SAFE_ROOM_VERSIONS = ['1', '2', '3', '4'];
 
 function synthesizeReceipt(userId, event, receiptType) {
     // console.log("synthesizing receipt for "+event.getId());
@@ -85,9 +94,12 @@ function synthesizeReceipt(userId, event, receiptType) {
  * "<b>detached</b>", pending messages will appear in a separate list,
  * accessbile via {@link module:models/room#getPendingEvents}. Default:
  * "chronological".
- *
  * @param {boolean} [opts.timelineSupport = false] Set to true to enable improved
  * timeline support.
+ * @param {boolean} [opts.unstableClientRelationAggregation = false]
+ * Optional. Set to true to enable client-side aggregation of event relations
+ * via `EventTimelineSet#getRelationsForEvent`.
+ * This feature is currently unstable and the API may change without notice.
  *
  * @prop {string} roomId The ID of this room.
  * @prop {string} name The human-readable display name for this room.
@@ -199,7 +211,7 @@ utils.inherits(Room, EventEmitter);
 Room.prototype.getVersion = function() {
     const createEvent = this.currentState.getStateEvents("m.room.create", "");
     if (!createEvent) {
-        console.warn("Room " + this.room_id + " does not have an m.room.create event");
+        logger.warn("Room " + this.room_id + " does not have an m.room.create event");
         return '1';
     }
     const ver = createEvent.getContent()['room_version'];
@@ -211,12 +223,108 @@ Room.prototype.getVersion = function() {
  * Determines whether this room needs to be upgraded to a new version
  * @returns {string?} What version the room should be upgraded to, or null if
  *     the room does not require upgrading at this time.
+ * @deprecated Use #getRecommendedVersion() instead
  */
 Room.prototype.shouldUpgradeToVersion = function() {
-    // This almost certainly won't be the way this actually works - this
-    // is essentially a stub method.
-    if (this.getVersion() === LATEST_ROOM_VERSION) return null;
-    return LATEST_ROOM_VERSION;
+    // TODO: Remove this function.
+    // This makes assumptions about which versions are safe, and can easily
+    // be wrong. Instead, people are encouraged to use getRecommendedVersion
+    // which determines a safer value. This function doesn't use that function
+    // because this is not async-capable, and to avoid breaking the contract
+    // we're deprecating this.
+
+    if (!SAFE_ROOM_VERSIONS.includes(this.getVersion())) {
+        return KNOWN_SAFE_ROOM_VERSION;
+    }
+
+    return null;
+};
+
+/**
+ * Determines the recommended room version for the room. This returns an
+ * object with 3 properties: <code>version</code> as the new version the
+ * room should be upgraded to (may be the same as the current version);
+ * <code>needsUpgrade</code> to indicate if the room actually can be
+ * upgraded (ie: does the current version not match?); and <code>urgent</code>
+ * to indicate if the new version patches a vulnerability in a previous
+ * version.
+ * @returns {Promise<{version: string, needsUpgrade: bool, urgent: bool}>}
+ * Resolves to the version the room should be upgraded to.
+ */
+Room.prototype.getRecommendedVersion = async function() {
+    const capabilities = await this._client.getCapabilities();
+    let versionCap = capabilities["m.room_versions"];
+    if (!versionCap) {
+        versionCap = {
+            default: KNOWN_SAFE_ROOM_VERSION,
+            available: {},
+        };
+        for (const safeVer of SAFE_ROOM_VERSIONS) {
+            versionCap.available[safeVer] = "stable";
+        }
+    }
+
+    let result = this._checkVersionAgainstCapability(versionCap);
+    if (result.urgent && result.needsUpgrade) {
+        // Something doesn't feel right: we shouldn't need to update
+        // because the version we're on should be in the protocol's
+        // namespace. This usually means that the server was updated
+        // before the client was, making us think the newest possible
+        // room version is not stable. As a solution, we'll refresh
+        // the capability we're using to determine this.
+        logger.warn(
+            "Refreshing room version capability because the server looks " +
+            "to be supporting a newer room version we don't know about.",
+        );
+
+        const caps = await this._client.getCapabilities(true);
+        versionCap = caps["m.room_versions"];
+        if (!versionCap) {
+            logger.warn("No room version capability - assuming upgrade required.");
+            return result;
+        } else {
+            result = this._checkVersionAgainstCapability(versionCap);
+        }
+    }
+
+    return result;
+};
+
+Room.prototype._checkVersionAgainstCapability = function(versionCap) {
+    const currentVersion = this.getVersion();
+    logger.log(`[${this.roomId}] Current version: ${currentVersion}`);
+    logger.log(`[${this.roomId}] Version capability: `, versionCap);
+
+    const result = {
+        version: currentVersion,
+        needsUpgrade: false,
+        urgent: false,
+    };
+
+    // If the room is on the default version then nothing needs to change
+    if (currentVersion === versionCap.default) return result;
+
+    const stableVersions = Object.keys(versionCap.available)
+        .filter((v) => versionCap.available[v] === 'stable');
+
+    // Check if the room is on an unstable version. We determine urgency based
+    // off the version being in the Matrix spec namespace or not (if the version
+    // is in the current namespace and unstable, the room is probably vulnerable).
+    if (!stableVersions.includes(currentVersion)) {
+        result.version = versionCap.default;
+        result.needsUpgrade = true;
+        result.urgent = !!this.getVersion().match(/^[0-9]+[0-9.]*$/g);
+        if (result.urgent) {
+            logger.warn(`URGENT upgrade required on ${this.roomId}`);
+        } else {
+            logger.warn(`Non-urgent upgrade required on ${this.roomId}`);
+        }
+        return result;
+    }
+
+    // The room is on a stable, but non-default, version by this point.
+    // No upgrade needed.
+    return result;
 };
 
 /**
@@ -239,11 +347,28 @@ Room.prototype.userMayUpgradeRoom = function(userId) {
 Room.prototype.getPendingEvents = function() {
     if (this._opts.pendingEventOrdering !== "detached") {
         throw new Error(
-            "Cannot call getPendingEventList with pendingEventOrdering == " +
+            "Cannot call getPendingEvents with pendingEventOrdering == " +
                 this._opts.pendingEventOrdering);
     }
 
     return this._pendingEventList;
+};
+
+/**
+ * Check whether the pending event list contains a given event by ID.
+ *
+ * @param {string} eventId The event ID to check for.
+ * @return {boolean}
+ * @throws If <code>opts.pendingEventOrdering</code> was not 'detached'
+ */
+Room.prototype.hasPendingEvent = function(eventId) {
+    if (this._opts.pendingEventOrdering !== "detached") {
+        throw new Error(
+            "Cannot call hasPendingEvent with pendingEventOrdering == " +
+                this._opts.pendingEventOrdering);
+    }
+
+    return this._pendingEventList.some(event => event.getId() === eventId);
 };
 
 /**
@@ -392,7 +517,7 @@ Room.prototype._loadMembers = async function() {
     if (rawMembersEvents === null) {
         fromServer = true;
         rawMembersEvents = await this._loadMembersFromServer();
-        console.log(`LL: got ${rawMembersEvents.length} ` +
+        logger.log(`LL: got ${rawMembersEvents.length} ` +
             `members from server for room ${this.roomId}`);
     }
     const memberEvents = rawMembersEvents.map(this._client.getEventMapper());
@@ -420,7 +545,7 @@ Room.prototype.loadMembersIfNeeded = function() {
     const inMemoryUpdate = this._loadMembers().then((result) => {
         this.currentState.setOutOfBandMembers(result.memberEvents);
         // now the members are loaded, start to track the e2e devices if needed
-        if (this._client.isRoomEncrypted(this.roomId)) {
+        if (this._client.isCryptoEnabled() && this._client.isRoomEncrypted(this.roomId)) {
             this._client._crypto.trackRoomDevices(this.roomId);
         }
         return result.fromServer;
@@ -436,21 +561,21 @@ Room.prototype.loadMembersIfNeeded = function() {
             const oobMembers = this.currentState.getMembers()
                 .filter((m) => m.isOutOfBand())
                 .map((m) => m.events.member.event);
-            console.log(`LL: telling store to write ${oobMembers.length}`
+            logger.log(`LL: telling store to write ${oobMembers.length}`
                 + ` members for room ${this.roomId}`);
             const store = this._client.store;
             return store.setOutOfBandMembers(this.roomId, oobMembers)
                 // swallow any IDB error as we don't want to fail
                 // because of this
                 .catch((err) => {
-                    console.log("LL: storing OOB room members failed, oh well",
+                    logger.log("LL: storing OOB room members failed, oh well",
                         err);
                 });
         }
     }).catch((err) => {
         // as this is not awaited anywhere,
         // at least show the error in the console
-        console.error(err);
+        logger.error(err);
     });
 
     this._membersPromise = inMemoryUpdate;
@@ -476,9 +601,9 @@ Room.prototype.clearLoadedMembersIfNeeded = async function() {
  */
 Room.prototype._cleanupAfterLeaving = function() {
     this.clearLoadedMembersIfNeeded().catch((err) => {
-        console.error(`error after clearing loaded members from ` +
+        logger.error(`error after clearing loaded members from ` +
             `room ${this.roomId} after leaving`);
-        console.dir(err);
+        logger.log(err);
     });
 };
 
@@ -518,6 +643,29 @@ Room.prototype._fixUpLegacyTimelineFields = function() {
                         .getState(EventTimeline.BACKWARDS);
     this.currentState = this.getLiveTimeline()
                             .getState(EventTimeline.FORWARDS);
+};
+
+/**
+ * Returns whether there are any devices in the room that are unverified
+ *
+ * Note: Callers should first check if crypto is enabled on this device. If it is
+ * disabled, then we aren't tracking room devices at all, so we can't answer this, and an
+ * error will be thrown.
+ *
+ * @return {bool} the result
+ */
+Room.prototype.hasUnverifiedDevices = async function() {
+    if (!this._client.isRoomEncrypted(this.roomId)) {
+        return false;
+    }
+    const e2eMembers = await this.getEncryptionTargetMembers();
+    for (const member of e2eMembers) {
+        const devices = await this._client.getStoredDevicesForUser(member.userId);
+        if (devices.some((device) => device.isUnverified())) {
+            return true;
+        }
+    }
+    return false;
 };
 
 /**
@@ -633,7 +781,7 @@ Room.prototype.getBlacklistUnverifiedDevices = function() {
  * @param {string} resizeMethod The thumbnail resize method to use, either
  * "crop" or "scale".
  * @param {boolean} allowDefault True to allow an identicon for this room if an
- * avatar URL wasn't explicitly set. Default: true.
+ * avatar URL wasn't explicitly set. Default: true. (Deprecated)
  * @return {?string} the avatar URL or null.
  */
 Room.prototype.getAvatarUrl = function(baseUrl, width, height, resizeMethod,
@@ -667,20 +815,20 @@ Room.prototype.getAvatarUrl = function(baseUrl, width, height, resizeMethod,
  * @return {array} The room's alias as an array of strings
  */
 Room.prototype.getAliases = function() {
-    const alias_strings = [];
+    const aliasStrings = [];
 
-    const alias_events = this.currentState.getStateEvents("m.room.aliases");
-    if (alias_events) {
-        for (let i = 0; i < alias_events.length; ++i) {
-            const alias_event = alias_events[i];
-            if (utils.isArray(alias_event.getContent().aliases)) {
+    const aliasEvents = this.currentState.getStateEvents("m.room.aliases");
+    if (aliasEvents) {
+        for (let i = 0; i < aliasEvents.length; ++i) {
+            const aliasEvent = aliasEvents[i];
+            if (utils.isArray(aliasEvent.getContent().aliases)) {
                 Array.prototype.push.apply(
-                    alias_strings, alias_event.getContent().aliases,
+                    aliasStrings, aliasEvent.getContent().aliases,
                 );
             }
         }
     }
-    return alias_strings;
+    return aliasStrings;
 };
 
 /**
@@ -902,8 +1050,7 @@ Room.prototype.removeFilteredTimelineSet = function(filter) {
  * @private
  */
 Room.prototype._addLiveEvent = function(event, duplicateStrategy) {
-    let i;
-    if (event.getType() === "m.room.redaction") {
+    if (event.isRedaction()) {
         const redactId = event.event.redacts;
 
         // if we know about this event, redact its contents now.
@@ -936,7 +1083,7 @@ Room.prototype._addLiveEvent = function(event, duplicateStrategy) {
     }
 
     // add to our timeline sets
-    for (i = 0; i < this._timelineSets.length; i++) {
+    for (let i = 0; i < this._timelineSets.length; i++) {
         this._timelineSets[i].addLiveEvent(event, duplicateStrategy);
     }
 
@@ -1000,10 +1147,30 @@ Room.prototype.addPendingEvent = function(event, txnId) {
 
     if (this._opts.pendingEventOrdering == "detached") {
         if (this._pendingEventList.some((e) => e.status === EventStatus.NOT_SENT)) {
-            console.warn("Setting event as NOT_SENT due to messages in the same state");
-            event.status = EventStatus.NOT_SENT;
+            logger.warn("Setting event as NOT_SENT due to messages in the same state");
+            event.setStatus(EventStatus.NOT_SENT);
         }
         this._pendingEventList.push(event);
+
+        if (event.isRelation()) {
+            // For pending events, add them to the relations collection immediately.
+            // (The alternate case below already covers this as part of adding to
+            // the timeline set.)
+            this._aggregateNonLiveRelation(event);
+        }
+
+        if (event.isRedaction()) {
+            const redactId = event.event.redacts;
+            let redactedEvent = this._pendingEventList &&
+                this._pendingEventList.find(e => e.getId() === redactId);
+            if (!redactedEvent) {
+                redactedEvent = this.getUnfilteredTimelineSet().findEventById(redactId);
+            }
+            if (redactedEvent) {
+                redactedEvent.markLocallyRedacted(event);
+                this.emit("Room.redaction", event, this);
+            }
+        }
     } else {
         for (let i = 0; i < this._timelineSets.length; i++) {
             const timelineSet = this._timelineSets[i];
@@ -1020,6 +1187,30 @@ Room.prototype.addPendingEvent = function(event, txnId) {
     }
 
     this.emit("Room.localEchoUpdated", event, this, null, null);
+};
+/**
+ * Used to aggregate the local echo for a relation, and also
+ * for re-applying a relation after it's redaction has been cancelled,
+ * as the local echo for the redaction of the relation would have
+ * un-aggregated the relation. Note that this is different from regular messages,
+ * which are just kept detached for their local echo.
+ *
+ * Also note that live events are aggregated in the live EventTimelineSet.
+ * @param {module:models/event.MatrixEvent} event the relation event that needs to be aggregated.
+ */
+Room.prototype._aggregateNonLiveRelation = function(event) {
+    // TODO: We should consider whether this means it would be a better
+    // design to lift the relations handling up to the room instead.
+    for (let i = 0; i < this._timelineSets.length; i++) {
+        const timelineSet = this._timelineSets[i];
+        if (timelineSet.getFilter()) {
+            if (this._filter.filterRoomTimeline([event]).length) {
+                timelineSet.aggregateRelations(event);
+            }
+        } else {
+            timelineSet.aggregateRelations(event);
+        }
+    }
 };
 
 /**
@@ -1042,7 +1233,7 @@ Room.prototype._handleRemoteEcho = function(remoteEvent, localEvent) {
     const oldStatus = localEvent.status;
 
     // no longer pending
-    delete this._txnToEvent[remoteEvent.transaction_id];
+    delete this._txnToEvent[remoteEvent.getUnsigned().transaction_id];
 
     // if it's in the pending list, remove it
     if (this._pendingEventList) {
@@ -1110,7 +1301,7 @@ ALLOWED_TRANSITIONS[EventStatus.CANCELLED] =
  * @fires module:client~MatrixClient#event:"Room.localEchoUpdated"
  */
 Room.prototype.updatePendingEvent = function(event, newStatus, newEventId) {
-    console.log(`setting pendingEvent status to ${newStatus} in ${event.getRoomId()}`);
+    logger.log(`setting pendingEvent status to ${newStatus} in ${event.getRoomId()}`);
 
     // if the message was sent, we expect an event id
     if (newStatus == EventStatus.SENT && !newEventId) {
@@ -1142,11 +1333,11 @@ Room.prototype.updatePendingEvent = function(event, newStatus, newEventId) {
                         newStatus);
     }
 
-    event.status = newStatus;
+    event.setStatus(newStatus);
 
     if (newStatus == EventStatus.SENT) {
         // update the event id
-        event.event.event_id = newEventId;
+        event.replaceLocalEventId(newEventId);
 
         // if the event was already in the timeline (which will be the case if
         // opts.pendingEventOrdering==chronological), we need to update the
@@ -1157,19 +1348,37 @@ Room.prototype.updatePendingEvent = function(event, newStatus, newEventId) {
     } else if (newStatus == EventStatus.CANCELLED) {
         // remove it from the pending event list, or the timeline.
         if (this._pendingEventList) {
-            utils.removeElement(
-                this._pendingEventList,
-                function(ev) {
-                    return ev.getId() == oldEventId;
-                }, false,
-            );
+            const idx = this._pendingEventList.findIndex(ev => ev.getId() === oldEventId);
+            if (idx !== -1) {
+                const [removedEvent] = this._pendingEventList.splice(idx, 1);
+                if (removedEvent.isRedaction()) {
+                    this._revertRedactionLocalEcho(removedEvent);
+                }
+            }
         }
         this.removeEvent(oldEventId);
     }
 
-    this.emit("Room.localEchoUpdated", event, this, event.getId(), oldStatus);
+    this.emit("Room.localEchoUpdated", event, this, oldEventId, oldStatus);
 };
 
+Room.prototype._revertRedactionLocalEcho = function(redactionEvent) {
+    const redactId = redactionEvent.event.redacts;
+    if (!redactId) {
+        return;
+    }
+    const redactedEvent = this.getUnfilteredTimelineSet()
+        .findEventById(redactId);
+    if (redactedEvent) {
+        redactedEvent.unmarkLocallyRedacted();
+        // re-render after undoing redaction
+        this.emit("Room.redactionCancelled", redactionEvent, this);
+        // reapply relation now redaction failed
+        if (redactedEvent.isRelation()) {
+            this._aggregateNonLiveRelation(redactedEvent);
+        }
+    }
+};
 
 /**
  * Add some events to this room. This can include state events, message
@@ -1211,28 +1420,33 @@ Room.prototype.addLiveEvents = function(events, duplicateStrategy) {
     }
 
     for (i = 0; i < events.length; i++) {
-        if (events[i].getType() === "m.typing") {
-            this.currentState.setTypingEvent(events[i]);
-        } else if (events[i].getType() === "m.receipt") {
-            this.addReceipt(events[i]);
-        }
-        // N.B. account_data is added directly by /sync to avoid
-        // having to maintain an event.isAccountData() here
-        else {
-            // TODO: We should have a filter to say "only add state event
-            // types X Y Z to the timeline".
-            this._addLiveEvent(events[i], duplicateStrategy);
-        }
+        // TODO: We should have a filter to say "only add state event
+        // types X Y Z to the timeline".
+        this._addLiveEvent(events[i], duplicateStrategy);
+    }
+};
+
+/**
+ * Adds/handles ephemeral events such as typing notifications and read receipts.
+ * @param {MatrixEvent[]} events A list of events to process
+ */
+Room.prototype.addEphemeralEvents = function(events) {
+    for (const event of events) {
+        if (event.getType() === 'm.typing') {
+            this.currentState.setTypingEvent(event);
+        } else if (event.getType() === 'm.receipt') {
+            this.addReceipt(event);
+        } // else ignore - life is too short for us to care about these events
     }
 };
 
 /**
  * Removes events from this room.
- * @param {String[]} event_ids A list of event_ids to remove.
+ * @param {String[]} eventIds A list of eventIds to remove.
  */
-Room.prototype.removeEvents = function(event_ids) {
-    for (let i = 0; i < event_ids.length; ++i) {
-        this.removeEvent(event_ids[i]);
+Room.prototype.removeEvents = function(eventIds) {
+    for (let i = 0; i < eventIds.length; ++i) {
+        this.removeEvent(eventIds[i]);
     }
 };
 
@@ -1248,6 +1462,9 @@ Room.prototype.removeEvent = function(eventId) {
     for (let i = 0; i < this._timelineSets.length; i++) {
         const removed = this._timelineSets[i].removeEvent(eventId);
         if (removed) {
+            if (removed.isRedaction()) {
+                this._revertRedactionLocalEcho(removed);
+            }
             removedAny = true;
         }
     }
@@ -1335,6 +1552,40 @@ Room.prototype.getEventReadUpTo = function(userId, ignoreSynthesized) {
     }
 
     return receipts["m.read"][userId].eventId;
+};
+
+/**
+ * Determines if the given user has read a particular event ID with the known
+ * history of the room. This is not a definitive check as it relies only on
+ * what is available to the room at the time of execution.
+ * @param {String} userId The user ID to check the read state of.
+ * @param {String} eventId The event ID to check if the user read.
+ * @returns {Boolean} True if the user has read the event, false otherwise.
+ */
+Room.prototype.hasUserReadEvent = function(userId, eventId) {
+    const readUpToId = this.getEventReadUpTo(userId, false);
+    if (readUpToId === eventId) return true;
+
+    if (this.timeline.length
+        && this.timeline[this.timeline.length - 1].getSender()
+        && this.timeline[this.timeline.length - 1].getSender() === userId) {
+        // It doesn't matter where the event is in the timeline, the user has read
+        // it because they've sent the latest event.
+        return true;
+    }
+
+    for (let i = this.timeline.length - 1; i >= 0; --i) {
+        const ev = this.timeline[i];
+
+        // If we encounter the target event first, the user hasn't read it
+        // however if we encounter the readUpToId first then the user has read
+        // it. These rules apply because we're iterating bottom-up.
+        if (ev.getId() === eventId) return false;
+        if (ev.getId() === readUpToId) return true;
+    }
+
+    // We don't know if the user has read it, so assume not.
+    return false;
 };
 
 /**
@@ -1610,7 +1861,7 @@ function calculateRoomName(room, userId, ignoreRoomNameEvent) {
 function memberNamesToRoomName(names, count = (names.length + 1)) {
     const countWithoutMe = count - 1;
     if (!names.length) {
-       return count <= 1 ? "Empty room" : null;
+       return "Empty room";
     } else if (names.length === 1 && countWithoutMe <= 1) {
         return names[0];
     } else if (names.length === 2 && countWithoutMe <= 2) {
@@ -1637,8 +1888,19 @@ module.exports = Room;
  * event).
  *
  * @event module:client~MatrixClient#"Room.redaction"
- * @param {MatrixEvent} event The matrix event which was redacted
+ * @param {MatrixEvent} event The matrix redaction event
  * @param {Room} room The room containing the redacted event
+ */
+
+/**
+ * Fires when an event that was previously redacted isn't anymore.
+ * This happens when the redaction couldn't be sent and
+ * was subsequently cancelled by the user. Redactions have a local echo
+ * which is undone in this scenario.
+ *
+ * @event module:client~MatrixClient#"Room.redactionCancelled"
+ * @param {MatrixEvent} event The matrix redaction event that was cancelled.
+ * @param {Room} room The room containing the unredacted event
  */
 
 /**

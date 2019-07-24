@@ -58,7 +58,7 @@ describe("MatrixClient opts", function() {
     };
 
     beforeEach(function() {
-        utils.beforeEach(this); // eslint-disable-line no-invalid-this
+        utils.beforeEach(this); // eslint-disable-line babel/no-invalid-this
         httpBackend = new HttpBackend();
     });
 
@@ -128,7 +128,7 @@ describe("MatrixClient opts", function() {
         beforeEach(function() {
             client = new MatrixClient({
                 request: httpBackend.requestFn,
-                store: new sdk.MatrixInMemoryStore(),
+                store: new sdk.MemoryStore(),
                 baseUrl: baseUrl,
                 userId: userId,
                 accessToken: accessToken,

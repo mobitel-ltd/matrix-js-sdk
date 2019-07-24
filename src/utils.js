@@ -19,6 +19,8 @@ limitations under the License.
  * @module utils
  */
 
+const unhomoglyph = require('unhomoglyph');
+
 /**
  * Encode a dictionary of query parameters.
  * @param {Object} params A dict of key/values to encode e.g.
@@ -328,7 +330,7 @@ const deepCompare = module.exports.deepCompare = function(x, y) {
         }
 
         // finally, compare each of x's keys with y
-        for (p in y) {
+        for (p in y) { // eslint-disable-line guard-for-in
             if (y.hasOwnProperty(p) !== x.hasOwnProperty(p)) {
                 return false;
             }
@@ -665,10 +667,35 @@ module.exports.isNumber = function(value) {
 
 /**
  * Removes zero width chars, diacritics and whitespace from the string
+ * Also applies an unhomoglyph on the string, to prevent similar looking chars
  * @param {string} str the string to remove hidden characters from
  * @return {string} a string with the hidden characters removed
  */
 module.exports.removeHiddenChars = function(str) {
-    return str.normalize('NFD').replace(removeHiddenCharsRegex, '');
+    return unhomoglyph(str.normalize('NFD').replace(removeHiddenCharsRegex, ''));
 };
 const removeHiddenCharsRegex = /[\u200B-\u200D\u0300-\u036f\uFEFF\s]/g;
+
+function escapeRegExp(string) {
+    return string.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+module.exports.escapeRegExp = escapeRegExp;
+
+module.exports.globToRegexp = function(glob, extended) {
+    extended = typeof(extended) === 'boolean' ? extended : true;
+    // From
+    // https://github.com/matrix-org/synapse/blob/abbee6b29be80a77e05730707602f3bbfc3f38cb/synapse/push/__init__.py#L132
+    // Because micromatch is about 130KB with dependencies,
+    // and minimatch is not much better.
+    let pat = escapeRegExp(glob);
+    pat = pat.replace(/\\\*/g, '.*');
+    pat = pat.replace(/\?/g, '.');
+    if (extended) {
+        pat = pat.replace(/\\\[(!|)(.*)\\]/g, function(match, p1, p2, offset, string) {
+            const first = p1 && '^' || '';
+            const second = p2.replace(/\\-/, '-');
+            return '[' + first + second + ']';
+        });
+    }
+    return pat;
+};

@@ -21,6 +21,7 @@ const EventEmitter = require("events").EventEmitter;
 
 const utils = require("../utils");
 const RoomMember = require("./room-member");
+import logger from '../../src/logger';
 
 // possible statuses for out-of-band member loading
 const OOB_STATUS_NOTSTARTED = 1;
@@ -75,6 +76,8 @@ function RoomState(roomId, oobMemberFlags = undefined) {
         // userId: RoomMember
     };
     this._updateModifiedTime();
+
+    // stores fuzzy matches to a list of userIDs (applies utils.removeHiddenChars to keys)
     this._displayNameToUserIds = {};
     this._userIdsToDisplayNames = {};
     this._tokenToInvite = {}; // 3pid invite state_key to m.room.member invite
@@ -152,6 +155,16 @@ RoomState.prototype.setInvitedMemberCount = function(count) {
  */
 RoomState.prototype.getMembers = function() {
     return utils.values(this.members);
+};
+
+/**
+ * Get all RoomMembers in this room, excluding the user IDs provided.
+ * @param {Array<string>} excludedIds The user IDs to exclude.
+ * @return {Array<RoomMember>} A list of RoomMembers.
+ */
+RoomState.prototype.getMembersExcept = function(excludedIds) {
+    return utils.values(this.members)
+        .filter((m) => !excludedIds.includes(m.userId));
 };
 
 /**
@@ -435,7 +448,7 @@ RoomState.prototype.clearOutOfBandMembers = function() {
             delete this.members[userId];
         }
     });
-    console.log(`LL: RoomState removed ${count} members...`);
+    logger.log(`LL: RoomState removed ${count} members...`);
     this._oobMemberFlags.status = OOB_STATUS_NOTSTARTED;
 };
 
@@ -444,11 +457,11 @@ RoomState.prototype.clearOutOfBandMembers = function() {
  * @param {MatrixEvent[]} stateEvents array of membership state events
  */
 RoomState.prototype.setOutOfBandMembers = function(stateEvents) {
-    console.log(`LL: RoomState about to set ${stateEvents.length} OOB members ...`);
+    logger.log(`LL: RoomState about to set ${stateEvents.length} OOB members ...`);
     if (this._oobMemberFlags.status !== OOB_STATUS_INPROGRESS) {
         return;
     }
-    console.log(`LL: RoomState put in OOB_STATUS_FINISHED state ...`);
+    logger.log(`LL: RoomState put in OOB_STATUS_FINISHED state ...`);
     this._oobMemberFlags.status = OOB_STATUS_FINISHED;
     stateEvents.forEach((e) => this._setOutOfBandMember(e));
 };
@@ -519,12 +532,12 @@ RoomState.prototype.getLastModifiedTime = function() {
 };
 
 /**
- * Get user IDs with the specified display name.
+ * Get user IDs with the specified or similar display names.
  * @param {string} displayName The display name to get user IDs from.
  * @return {string[]} An array of user IDs or an empty array.
  */
 RoomState.prototype.getUserIdsWithDisplayName = function(displayName) {
-    return this._displayNameToUserIds[displayName] || [];
+    return this._displayNameToUserIds[utils.removeHiddenChars(displayName)] || [];
 };
 
 /**

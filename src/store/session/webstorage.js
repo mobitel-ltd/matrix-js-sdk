@@ -22,6 +22,7 @@ limitations under the License.
  */
 
 const utils = require("../../utils");
+import logger from '../../logger';
 
 const DEBUG = false;  // set true to enable console logging.
 const E2E_PREFIX = "session.e2e.";
@@ -190,11 +191,22 @@ WebStorageSessionStore.prototype = {
     removeAllEndToEndRooms: function() {
         removeByPrefix(this.store, keyEndToEndRoom(''));
     },
+
+    setLocalTrustedBackupPubKey: function(pubkey) {
+        this.store.setItem(KEY_END_TO_END_TRUSTED_BACKUP_PUBKEY, pubkey);
+    },
+
+    // XXX: This store is deprecated really, but added this as a temporary
+    // thing until cross-signing lands.
+    getLocalTrustedBackupPubKey: function() {
+        return this.store.getItem(KEY_END_TO_END_TRUSTED_BACKUP_PUBKEY);
+    },
 };
 
 const KEY_END_TO_END_ACCOUNT = E2E_PREFIX + "account";
 const KEY_END_TO_END_DEVICE_SYNC_TOKEN = E2E_PREFIX + "device_sync_token";
 const KEY_END_TO_END_DEVICE_LIST_TRACKING_STATUS = E2E_PREFIX + "device_tracking";
+const KEY_END_TO_END_TRUSTED_BACKUP_PUBKEY = E2E_PREFIX + "trusted_backup_pubkey";
 
 function keyEndToEndDevicesForUser(userId) {
     return E2E_PREFIX + "devices/" + userId;
@@ -246,7 +258,7 @@ function removeByPrefix(store, prefix) {
 
 function debuglog() {
     if (DEBUG) {
-        console.log(...arguments);
+        logger.log(...arguments);
     }
 }
 

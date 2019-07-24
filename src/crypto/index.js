@@ -1,7 +1,7 @@
 /*
 Copyright 2016 OpenMarket Ltd
 Copyright 2017 Vector Creations Ltd
-Copyright 2018 New Vector Ltd
+Copyright 2018-2019 New Vector Ltd
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@ const anotherjson = require('another-json');
 import Promise from 'bluebird';
 import {EventEmitter} from 'events';
 
-const logger = require("../logger");
+import logger from '../logger';
 const utils = require("../utils");
 const OlmDevice = require("./OlmDevice");
 const olmlib = require("./olmlib");
@@ -33,13 +33,40 @@ const algorithms = require("./algorithms");
 const DeviceInfo = require("./deviceinfo");
 const DeviceVerification = DeviceInfo.DeviceVerification;
 const DeviceList = require('./DeviceList').default;
+import { randomString } from '../randomstring';
 
 import OutgoingRoomKeyRequestManager from './OutgoingRoomKeyRequestManager';
 import IndexedDBCryptoStore from './store/indexeddb-crypto-store';
 
+import {ShowQRCode, ScanQRCode} from './verification/QRCode';
+import SAS from './verification/SAS';
+import {
+    newUserCancelledError,
+    newUnexpectedMessageError,
+    newUnknownMethodError,
+} from './verification/Error';
+
+const defaultVerificationMethods = {
+    [ScanQRCode.NAME]: ScanQRCode,
+    [ShowQRCode.NAME]: ShowQRCode,
+    [SAS.NAME]: SAS,
+};
+
+/**
+ * verification method names
+ */
+export const verificationMethods = {
+    QR_CODE_SCAN: ScanQRCode.NAME,
+    QR_CODE_SHOW: ShowQRCode.NAME,
+    SAS: SAS.NAME,
+};
+
 export function isCryptoAvailable() {
     return Boolean(global.Olm);
 }
+
+const MIN_FORCE_SESSION_INTERVAL_MS = 60 * 60 * 1000;
+const KEY_BACKUP_KEYS_PER_REQUEST = 200;
 
 /**
  * Cryptography bits
@@ -66,9 +93,13 @@ export function isCryptoAvailable() {
  *    storage for the crypto layer.
  *
  * @param {RoomList} roomList An initialised RoomList object
+ *
+ * @param {Array} verificationMethods Array of verification methods to use.
+ *    Each element can either be a string from MatrixClient.verificationMethods
+ *    or a class that implements a verification method.
  */
 export default function Crypto(baseApis, sessionStore, userId, deviceId,
-                clientStore, cryptoStore, roomList) {
+    clientStore, cryptoStore, roomList, verificationMethods) {
     this._baseApis = baseApis;
     this._sessionStore = sessionStore;
     this._userId = userId;
@@ -76,10 +107,36 @@ export default function Crypto(baseApis, sessionStore, userId, deviceId,
     this._clientStore = clientStore;
     this._cryptoStore = cryptoStore;
     this._roomList = roomList;
+    this._verificationMethods = new Map();
+    if (verificationMethods) {
+        for (const method of verificationMethods) {
+            if (typeof method === "string") {
+                if (defaultVerificationMethods[method]) {
+                    this._verificationMethods.set(
+                        method,
+                        defaultVerificationMethods[method],
+                    );
+                }
+            } else if (method.NAME) {
+                this._verificationMethods.set(
+                    method.NAME,
+                    method,
+                );
+            }
+        }
+    }
 
-    this._olmDevice = new OlmDevice(sessionStore, cryptoStore);
+    // track whether this device's megolm keys are being backed up incrementally
+    // to the server or not.
+    // XXX: this should probably have a single source of truth from OlmAccount
+    this.backupInfo = null; // The info dict from /room_keys/version
+    this.backupKey = null; // The encryption key object
+    this._checkedForBackup = false; // Have we checked the server for a backup we can use?
+    this._sendingBackups = false; // Are we currently sending backups?
+
+    this._olmDevice = new OlmDevice(cryptoStore);
     this._deviceList = new DeviceList(
-        baseApis, cryptoStore, sessionStore, this._olmDevice,
+        baseApis, cryptoStore, this._olmDevice,
     );
 
     // the last time we did a check for the number of one-time-keys on the
@@ -120,6 +177,17 @@ export default function Crypto(baseApis, sessionStore, userId, deviceId,
     // has happened for a given room. This is delayed
     // to avoid loading room members as long as possible.
     this._roomDeviceTrackingState = {};
+
+    // The timestamp of the last time we forced establishment
+    // of a new session for each device, in milliseconds.
+    // {
+    //     userId: {
+    //         deviceId: 1234567890000,
+    //     },
+    // }
+    this._lastNewSessionForced = {};
+
+    this._verificationTransactions = new Map();
 }
 utils.inherits(Crypto, EventEmitter);
 
@@ -129,27 +197,11 @@ utils.inherits(Crypto, EventEmitter);
  * Returns a promise which resolves once the crypto module is ready for use.
  */
 Crypto.prototype.init = async function() {
+    logger.log("Crypto: initialising Olm...");
     await global.Olm.init();
-
-    const sessionStoreHasAccount = Boolean(this._sessionStore.getEndToEndAccount());
-    let cryptoStoreHasAccount;
-    await this._cryptoStore.doTxn(
-        'readonly', [IndexedDBCryptoStore.STORE_ACCOUNT], (txn) => {
-            this._cryptoStore.getAccount(txn, (pickledAccount) => {
-                cryptoStoreHasAccount = Boolean(pickledAccount);
-            });
-        },
-    );
-    if (sessionStoreHasAccount && !cryptoStoreHasAccount) {
-        // we're about to migrate to the crypto store
-        this.emit("crypto.warning", 'CRYPTO_WARNING_ACCOUNT_MIGRATED');
-    } else if (sessionStoreHasAccount && cryptoStoreHasAccount) {
-        // There's an account in both stores: an old version of
-        // the code has been run against this store.
-        this.emit("crypto.warning", 'CRYPTO_WARNING_OLD_VERSION_DETECTED');
-    }
-
+    logger.log("Crypto: initialising Olm device...");
     await this._olmDevice.init();
+    logger.log("Crypto: loading device list...");
     await this._deviceList.load();
 
     // build our device keys: these will later be uploaded
@@ -158,6 +210,7 @@ Crypto.prototype.init = async function() {
     this._deviceKeys["curve25519:" + this._deviceId] =
         this._olmDevice.deviceCurve25519Key;
 
+    logger.log("Crypto: fetching own devices...");
     let myDevices = this._deviceList.getRawStoredDevicesForUser(
         this._userId,
     );
@@ -167,7 +220,8 @@ Crypto.prototype.init = async function() {
     }
 
     if (!myDevices[this._deviceId]) {
-        // add our own deviceinfo to the sessionstore
+        // add our own deviceinfo to the cryptoStore
+        logger.log("Crypto: adding this device to the store...");
         const deviceInfo = {
             keys: this._deviceKeys,
             algorithms: this._supportedAlgorithms,
@@ -181,6 +235,170 @@ Crypto.prototype.init = async function() {
         );
         this._deviceList.saveIfDirty();
     }
+
+    logger.log("Crypto: checking for key backup...");
+    this._checkAndStartKeyBackup();
+};
+
+/**
+ * Check the server for an active key backup and
+ * if one is present and has a valid signature from
+ * one of the user's verified devices, start backing up
+ * to it.
+ */
+Crypto.prototype._checkAndStartKeyBackup = async function() {
+    logger.log("Checking key backup status...");
+    if (this._baseApis.isGuest()) {
+        logger.log("Skipping key backup check since user is guest");
+        this._checkedForBackup = true;
+        return null;
+    }
+    let backupInfo;
+    try {
+        backupInfo = await this._baseApis.getKeyBackupVersion();
+    } catch (e) {
+        logger.log("Error checking for active key backup", e);
+        if (e.httpStatus / 100 === 4) {
+            // well that's told us. we won't try again.
+            this._checkedForBackup = true;
+        }
+        return null;
+    }
+    this._checkedForBackup = true;
+
+    const trustInfo = await this.isKeyBackupTrusted(backupInfo);
+
+    if (trustInfo.usable && !this.backupInfo) {
+        logger.log(
+            "Found usable key backup v" + backupInfo.version +
+            ": enabling key backups",
+        );
+        this._baseApis.enableKeyBackup(backupInfo);
+    } else if (!trustInfo.usable && this.backupInfo) {
+        logger.log("No usable key backup: disabling key backup");
+        this._baseApis.disableKeyBackup();
+    } else if (!trustInfo.usable && !this.backupInfo) {
+        logger.log("No usable key backup: not enabling key backup");
+    } else if (trustInfo.usable && this.backupInfo) {
+        // may not be the same version: if not, we should switch
+        if (backupInfo.version !== this.backupInfo.version) {
+            logger.log(
+                "On backup version " + this.backupInfo.version + " but found " +
+                "version " + backupInfo.version + ": switching.",
+            );
+            this._baseApis.disableKeyBackup();
+            this._baseApis.enableKeyBackup(backupInfo);
+        } else {
+            logger.log("Backup version " + backupInfo.version + " still current");
+        }
+    }
+
+    return {backupInfo, trustInfo};
+};
+
+Crypto.prototype.setTrustedBackupPubKey = async function(trustedPubKey) {
+    // This should be redundant post cross-signing is a thing, so just
+    // plonk it in localStorage for now.
+    this._sessionStore.setLocalTrustedBackupPubKey(trustedPubKey);
+    await this.checkKeyBackup();
+};
+
+/**
+ * Forces a re-check of the key backup and enables/disables it
+ * as appropriate.
+ *
+ * @return {Object} Object with backup info (as returned by
+ *     getKeyBackupVersion) in backupInfo and
+ *     trust information (as returned by isKeyBackupTrusted)
+ *     in trustInfo.
+ */
+Crypto.prototype.checkKeyBackup = async function() {
+    this._checkedForBackup = false;
+    const returnInfo = await this._checkAndStartKeyBackup();
+    return returnInfo;
+};
+
+/**
+ * @param {object} backupInfo key backup info dict from /room_keys/version
+ * @return {object} {
+ *     usable: [bool], // is the backup trusted, true iff there is a sig that is valid & from a trusted device
+ *     sigs: [
+ *         valid: [bool || null], // true: valid, false: invalid, null: cannot attempt validation
+ *         deviceId: [string],
+ *         device: [DeviceInfo || null],
+ *     ]
+ * }
+ */
+Crypto.prototype.isKeyBackupTrusted = async function(backupInfo) {
+    const ret = {
+        usable: false,
+        trusted_locally: false,
+        sigs: [],
+    };
+
+    if (
+        !backupInfo ||
+        !backupInfo.algorithm ||
+        !backupInfo.auth_data ||
+        !backupInfo.auth_data.public_key ||
+        !backupInfo.auth_data.signatures
+    ) {
+        logger.info("Key backup is absent or missing required data");
+        return ret;
+    }
+
+    const trustedPubkey = this._sessionStore.getLocalTrustedBackupPubKey();
+
+    if (backupInfo.auth_data.public_key === trustedPubkey) {
+        logger.info("Backup public key " + trustedPubkey + " is trusted locally");
+        ret.trusted_locally = true;
+    }
+
+    const mySigs = backupInfo.auth_data.signatures[this._userId] || [];
+
+    for (const keyId of Object.keys(mySigs)) {
+        const keyIdParts = keyId.split(':');
+        if (keyIdParts[0] !== 'ed25519') {
+            logger.log("Ignoring unknown signature type: " + keyIdParts[0]);
+            continue;
+        }
+        const sigInfo = { deviceId: keyIdParts[1] }; // XXX: is this how we're supposed to get the device ID?
+        const device = this._deviceList.getStoredDevice(
+            this._userId, sigInfo.deviceId,
+        );
+        if (device) {
+            sigInfo.device = device;
+            try {
+                await olmlib.verifySignature(
+                    this._olmDevice,
+                    // verifySignature modifies the object so we need to copy
+                    // if we verify more than one sig
+                    Object.assign({}, backupInfo.auth_data),
+                    this._userId,
+                    device.deviceId,
+                    device.getFingerprint(),
+                );
+                sigInfo.valid = true;
+            } catch (e) {
+                logger.info(
+                    "Bad signature from key ID " + keyId + " userID " + this._userId +
+                    " device ID " + device.deviceId + " fingerprint: " +
+                    device.getFingerprint(), backupInfo.auth_data, e,
+                );
+                sigInfo.valid = false;
+            }
+        } else {
+            sigInfo.valid = null; // Can't determine validity because we don't have the signing device
+            logger.info("Ignoring signature from unknown key " + keyId);
+        }
+        ret.sigs.push(sigInfo);
+    }
+
+    ret.usable = (
+        ret.sigs.some((s) => s.valid && s.device.isVerified()) ||
+        ret.trusted_locally
+    );
+    return ret;
 };
 
 /**
@@ -538,6 +756,81 @@ Crypto.prototype.setDeviceVerification = async function(
 };
 
 
+Crypto.prototype.requestVerification = function(userId, methods, devices) {
+    if (!methods) {
+        // .keys() returns an iterator, so we need to explicitly turn it into an array
+        methods = [...this._verificationMethods.keys()];
+    }
+    if (!devices) {
+        devices = Object.keys(this._deviceList.getRawStoredDevicesForUser(userId));
+    }
+    if (!this._verificationTransactions.has(userId)) {
+        this._verificationTransactions.set(userId, new Map);
+    }
+
+    const transactionId = randomString(32);
+
+    const promise = new Promise((resolve, reject) => {
+        this._verificationTransactions.get(userId).set(transactionId, {
+            request: {
+                methods: methods,
+                devices: devices,
+                resolve: resolve,
+                reject: reject,
+            },
+        });
+    });
+
+    const message = {
+        transaction_id: transactionId,
+        from_device: this._baseApis.deviceId,
+        methods: methods,
+        timestamp: Date.now(),
+    };
+    const msgMap = {};
+    for (const deviceId of devices) {
+        msgMap[deviceId] = message;
+    }
+    this._baseApis.sendToDevice("m.key.verification.request", {[userId]: msgMap});
+
+    return promise;
+};
+
+Crypto.prototype.beginKeyVerification = function(
+    method, userId, deviceId, transactionId,
+) {
+    if (!this._verificationTransactions.has(userId)) {
+        this._verificationTransactions.set(userId, new Map());
+    }
+    transactionId = transactionId || randomString(32);
+    if (method instanceof Array) {
+        if (method.length !== 2
+            || !this._verificationMethods.has(method[0])
+            || !this._verificationMethods.has(method[1])) {
+            throw newUnknownMethodError();
+        }
+        /*
+        return new TwoPartVerification(
+            this._verificationMethods[method[0]],
+            this._verificationMethods[method[1]],
+            userId, deviceId, transactionId,
+        );
+        */
+    } else if (this._verificationMethods.has(method)) {
+        const verifier = new (this._verificationMethods.get(method))(
+            this._baseApis, userId, deviceId, transactionId,
+        );
+        if (!this._verificationTransactions.get(userId).has(transactionId)) {
+            this._verificationTransactions.get(userId).set(transactionId, {});
+        }
+        this._verificationTransactions.get(userId).get(transactionId).verifier = verifier;
+        return verifier;
+    } else {
+        throw newUnknownMethodError();
+    }
+};
+
+
 /**
  * Get information on the active olm sessions with a user
  * <p>
@@ -596,7 +889,7 @@ Crypto.prototype.getEventSenderDeviceInfo = function(event) {
     // identity key of the device which set up the Megolm session.
 
     const device = this._deviceList.getDeviceByIdentityKey(
-        event.getSender(), algorithm, senderKey,
+        algorithm, senderKey,
     );
 
     if (device === null) {
@@ -647,7 +940,7 @@ Crypto.prototype.forceDiscardSession = function(roomId) {
 };
 
 /**
- * Configure a room to use encryption (ie, save a flag in the sessionstore).
+ * Configure a room to use encryption (ie, save a flag in the cryptoStore).
  *
  * @param {string} roomId The room ID to enable encryption in.
  *
@@ -823,6 +1116,7 @@ Crypto.prototype.exportRoomKeys = async function() {
                 const sess = this._olmDevice.exportInboundGroupSession(
                     s.senderKey, s.sessionId, s.sessionData,
                 );
+                delete sess.first_known_index;
                 sess.algorithm = olmlib.MEGOLM_ALGORITHM;
                 exportedSessions.push(sess);
             });
@@ -851,6 +1145,181 @@ Crypto.prototype.importRoomKeys = function(keys) {
         },
     );
 };
+
+/**
+ * Schedules sending all keys waiting to be sent to the backup, if not already
+ * scheduled. Retries if necessary.
+ *
+ * @param {number} maxDelay Maximum delay to wait in ms. 0 means no delay.
+ */
+Crypto.prototype.scheduleKeyBackupSend = async function(maxDelay = 10000) {
+    if (this._sendingBackups) return;
+
+    this._sendingBackups = true;
+
+    try {
+        // wait between 0 and `maxDelay` seconds, to avoid backup
+        // requests from different clients hitting the server all at
+        // the same time when a new key is sent
+        const delay = Math.random() * maxDelay;
+        await Promise.delay(delay);
+        let numFailures = 0; // number of consecutive failures
+        while (1) {
+            if (!this.backupKey) {
+                return;
+            }
+            try {
+                const numBackedUp =
+                    await this._backupPendingKeys(KEY_BACKUP_KEYS_PER_REQUEST);
+                if (numBackedUp === 0) {
+                    // no sessions left needing backup: we're done
+                    return;
+                }
+                numFailures = 0;
+            } catch (err) {
+                numFailures++;
+                logger.log("Key backup request failed", err);
+                if (err.data) {
+                    if (
+                        err.data.errcode == 'M_NOT_FOUND' ||
+                        err.data.errcode == 'M_WRONG_ROOM_KEYS_VERSION'
+                    ) {
+                        // Re-check key backup status on error, so we can be
+                        // sure to present the current situation when asked.
+                        await this.checkKeyBackup();
+                        // Backup version has changed or this backup version
+                        // has been deleted
+                        this.emit("crypto.keyBackupFailed", err.data.errcode);
+                        throw err;
+                    }
+                }
+            }
+            if (numFailures) {
+                // exponential backoff if we have failures
+                await Promise.delay(1000 * Math.pow(2, Math.min(numFailures - 1, 4)));
+            }
+        }
+    } finally {
+        this._sendingBackups = false;
+    }
+};
+
+/**
+ * Take some e2e keys waiting to be backed up and send them
+ * to the backup.
+ *
+ * @param {integer} limit Maximum number of keys to back up
+ * @returns {integer} Number of sessions backed up
+ */
+Crypto.prototype._backupPendingKeys = async function(limit) {
+    const sessions = await this._cryptoStore.getSessionsNeedingBackup(limit);
+    if (!sessions.length) {
+        return 0;
+    }
+
+    let remaining = await this._cryptoStore.countSessionsNeedingBackup();
+    this.emit("crypto.keyBackupSessionsRemaining", remaining);
+
+    const data = {};
+    for (const session of sessions) {
+        const roomId = session.sessionData.room_id;
+        if (data[roomId] === undefined) {
+            data[roomId] = {sessions: {}};
+        }
+
+        const sessionData = await this._olmDevice.exportInboundGroupSession(
+            session.senderKey, session.sessionId, session.sessionData,
+        );
+        sessionData.algorithm = olmlib.MEGOLM_ALGORITHM;
+        delete sessionData.session_id;
+        delete sessionData.room_id;
+        const firstKnownIndex = sessionData.first_known_index;
+        delete sessionData.first_known_index;
+        const encrypted = this.backupKey.encrypt(JSON.stringify(sessionData));
+
+        const forwardedCount =
+              (sessionData.forwarding_curve25519_key_chain || []).length;
+
+        const device = this._deviceList.getDeviceByIdentityKey(
+            olmlib.MEGOLM_ALGORITHM, session.senderKey,
+        );
+
+        data[roomId]['sessions'][session.sessionId] = {
+            first_message_index: firstKnownIndex,
+            forwarded_count: forwardedCount,
+            is_verified: !!(device && device.isVerified()),
+            session_data: encrypted,
+        };
+    }
+
+    await this._baseApis.sendKeyBackup(
+        undefined, undefined, this.backupInfo.version,
+        {rooms: data},
+    );
+
+    await this._cryptoStore.unmarkSessionsNeedingBackup(sessions);
+    remaining = await this._cryptoStore.countSessionsNeedingBackup();
+    this.emit("crypto.keyBackupSessionsRemaining", remaining);
+
+    return sessions.length;
+};
+
+Crypto.prototype.backupGroupSession = async function(
+    roomId, senderKey, forwardingCurve25519KeyChain,
+    sessionId, sessionKey, keysClaimed,
+    exportFormat,
+) {
+    if (!this.backupInfo) {
+        throw new Error("Key backups are not enabled");
+    }
+
+    await this._cryptoStore.markSessionsNeedingBackup([{
+        senderKey: senderKey,
+        sessionId: sessionId,
+    }]);
+
+    // don't wait for this to complete: it will delay so
+    // happens in the background
+    this.scheduleKeyBackupSend();
+};
+
+/**
+ * Marks all group sessions as needing to be backed up and schedules them to
+ * upload in the background as soon as possible.
+ */
+Crypto.prototype.scheduleAllGroupSessionsForBackup = async function() {
+    await this.flagAllGroupSessionsForBackup();
+
+    // Schedule keys to upload in the background as soon as possible.
+    this.scheduleKeyBackupSend(0 /* maxDelay */);
+};
+
+/**
+ * Marks all group sessions as needing to be backed up without scheduling
+ * them to upload in the background.
+ * @returns {Promise<int>} Resolves to the number of sessions requiring a backup.
+ */
+Crypto.prototype.flagAllGroupSessionsForBackup = async function() {
+    await this._cryptoStore.doTxn(
+        'readwrite',
+        [
+            IndexedDBCryptoStore.STORE_INBOUND_GROUP_SESSIONS,
+            IndexedDBCryptoStore.STORE_BACKUP,
+        ],
+        (txn) => {
+            this._cryptoStore.getAllEndToEndInboundGroupSessions(txn, (session) => {
+                if (session !== null) {
+                    this._cryptoStore.markSessionsNeedingBackup([session], txn);
+                }
+            });
+        },
+    );
+
+    const remaining = await this._cryptoStore.countSessionsNeedingBackup();
+    this.emit("crypto.keyBackupSessionsRemaining", remaining);
+    return remaining;
+};
+
 /* eslint-disable valid-jsdoc */    //https://github.com/eslint/eslint/issues/7307
 /**
  * Encrypt an event according to the configuration of the room.
@@ -965,10 +1434,14 @@ Crypto.prototype.handleDeviceListChanges = async function(syncData, syncDeviceLi
  *
  * @param {module:crypto~RoomKeyRequestBody} requestBody
  * @param {Array<{userId: string, deviceId: string}>} recipients
+ * @param {boolean} resend whether to resend the key request if there is
+ *    already one
+ *
+ * @return {Promise} a promise that resolves when the key request is queued
  */
-Crypto.prototype.requestRoomKey = function(requestBody, recipients) {
-    this._outgoingRoomKeyRequestManager.sendRoomKeyRequest(
-        requestBody, recipients,
+Crypto.prototype.requestRoomKey = function(requestBody, recipients, resend=false) {
+    return this._outgoingRoomKeyRequestManager.sendRoomKeyRequest(
+        requestBody, recipients, resend,
     ).catch((e) => {
         // this normally means we couldn't talk to the store
         logger.error(
@@ -982,11 +1455,9 @@ Crypto.prototype.requestRoomKey = function(requestBody, recipients) {
  *
  * @param {module:crypto~RoomKeyRequestBody} requestBody
  *    parameters to match for cancellation
- * @param {boolean} andResend
- *    if true, resend the key request after cancelling.
  */
-Crypto.prototype.cancelRoomKeyRequest = function(requestBody, andResend) {
-    this._outgoingRoomKeyRequestManager.cancelRoomKeyRequest(requestBody, andResend)
+Crypto.prototype.cancelRoomKeyRequest = function(requestBody) {
+    this._outgoingRoomKeyRequestManager.cancelRoomKeyRequest(requestBody)
     .catch((e) => {
         logger.warn("Error clearing pending room key requests", e);
     }).done();
@@ -1044,6 +1515,10 @@ Crypto.prototype.onSyncCompleted = async function(syncData) {
 
     // catch up on any new devices we got told about during the sync.
     this._deviceList.lastKnownSyncToken = nextSyncToken;
+
+    // we always track our own device list (for key backups etc)
+    this._deviceList.startTrackingDeviceList(this._userId);
+
     this._deviceList.refreshOutdatedDeviceLists();
 
     // we don't start uploading one-time keys until we've caught up with
@@ -1133,6 +1608,14 @@ Crypto.prototype._onToDeviceEvent = function(event) {
             this._onRoomKeyEvent(event);
         } else if (event.getType() == "m.room_key_request") {
             this._onRoomKeyRequestEvent(event);
+        } else if (event.getType() === "m.key.verification.request") {
+            this._onKeyVerificationRequest(event);
+        } else if (event.getType() === "m.key.verification.start") {
+            this._onKeyVerificationStart(event);
+        } else if (event.getContent().transaction_id) {
+            this._onKeyVerificationMessage(event);
+        } else if (event.getContent().msgtype === "m.bad.encrypted") {
+            this._onToDeviceBadEncrypted(event);
         } else if (event.isBeingDecrypted()) {
             // once the event has been decrypted, try again
             event.once('Event.decrypted', (ev) => {
@@ -1158,8 +1641,376 @@ Crypto.prototype._onRoomKeyEvent = function(event) {
         return;
     }
 
+    if (!this._checkedForBackup) {
+        // don't bother awaiting on this - the important thing is that we retry if we
+        // haven't managed to check before
+        this._checkAndStartKeyBackup();
+    }
+
     const alg = this._getRoomDecryptor(content.room_id, content.algorithm);
     alg.onRoomKeyEvent(event);
+};
+
+/**
+ * Handle a key verification request event.
+ *
+ * @private
+ * @param {module:models/event.MatrixEvent} event verification request event
+ */
+Crypto.prototype._onKeyVerificationRequest = function(event) {
+    if (event.isCancelled()) {
+        logger.warn("Ignoring flagged verification request from " + event.getSender());
+        return;
+    }
+
+    const content = event.getContent();
+    if (!("from_device" in content) || typeof content.from_device !== "string"
+        || !("transaction_id" in content) || typeof content.from_device !== "string"
+        || !("methods" in content) || !(content.methods instanceof Array)
+        || !("timestamp" in content) || typeof content.timestamp !== "number") {
+        logger.warn("received invalid verification request from " + event.getSender());
+        // ignore event if malformed
+        return;
+    }
+
+    const now = Date.now();
+    if (now < content.timestamp - (5 * 60 * 1000)
+        || now > content.timestamp + (10 * 60 * 1000)) {
+        // ignore if event is too far in the past or too far in the future
+        logger.log("received verification that is too old or from the future");
+        return;
+    }
+
+    const sender = event.getSender();
+    if (sender === this._userId && content.from_device === this._deviceId) {
+        // ignore requests from ourselves, because it doesn't make sense for a
+        // device to verify itself
+        return;
+    }
+    if (this._verificationTransactions.has(sender)) {
+        if (this._verificationTransactions.get(sender).has(content.transaction_id)) {
+            // transaction already exists: cancel it and drop the existing
+            // request because someone has gotten confused
+            const err = newUnexpectedMessageError({
+                transaction_id: content.transaction_id,
+            });
+            if (this._verificationTransactions.get(sender).get(content.transaction_id)
+                .verifier) {
+                this._verificationTransactions.get(sender).get(content.transaction_id)
+                    .verifier.cancel(err);
+            } else {
+                this._verificationTransactions.get(sender).get(content.transaction_id)
+                    .reject(err);
+                this.sendToDevice("m.key.verification.cancel", {
+                    [sender]: {
+                        [content.from_device]: err.getContent(),
+                    },
+                });
+            }
+            this._verificationTransactions.get(sender).delete(content.transaction_id);
+            return;
+        }
+    } else {
+        this._verificationTransactions.set(sender, new Map());
+    }
+
+    // determine what requested methods we support
+    const methods = [];
+    for (const method of content.methods) {
+        if (typeof method !== "string") {
+            continue;
+        }
+        if (this._verificationMethods.has(method)) {
+            methods.push(method);
+        }
+    }
+    if (methods.length === 0) {
+        this._baseApis.emit(
+            "crypto.verification.request.unknown",
+            event.getSender(),
+            () => {
+                this.sendToDevice("m.key.verification.cancel", {
+                    [sender]: {
+                        [content.from_device]: newUserCancelledError({
+                            transaction_id: content.transaction_id,
+                        }).getContent(),
+                    },
+                });
+            },
+        );
+    } else {
+        // notify the application of the verification request, so it can
+        // decide what to do with it
+        const request = {
+            event: event,
+            methods: methods,
+            beginKeyVerification: (method) => {
+                const verifier = this.beginKeyVerification(
+                    method,
+                    sender,
+                    content.from_device,
+                    content.transaction_id,
+                );
+                this._verificationTransactions.get(sender).get(content.transaction_id)
+                    .verifier = verifier;
+                return verifier;
+            },
+            cancel: () => {
+                this._baseApis.sendToDevice("m.key.verification.cancel", {
+                    [sender]: {
+                        [content.from_device]: newUserCancelledError({
+                            transaction_id: content.transaction_id,
+                        }).getContent(),
+                    },
+                });
+            },
+        };
+        this._verificationTransactions.get(sender).set(content.transaction_id, {
+            request: request,
+        });
+        this._baseApis.emit("crypto.verification.request", request);
+    }
+};
+
+/**
+ * Handle a key verification start event.
+ *
+ * @private
+ * @param {module:models/event.MatrixEvent} event verification start event
+ */
+Crypto.prototype._onKeyVerificationStart = function(event) {
+    if (event.isCancelled()) {
+        logger.warn("Ignoring flagged verification start from " + event.getSender());
+        return;
+    }
+
+    const sender = event.getSender();
+    const content = event.getContent();
+    const transactionId = content.transaction_id;
+    const deviceId = content.from_device;
+    if (!transactionId || !deviceId) {
+        // invalid request, and we don't have enough information to send a
+        // cancellation, so just ignore it
+        return;
+    }
+
+    let handler = this._verificationTransactions.has(sender)
+        && this._verificationTransactions.get(sender).get(transactionId);
+    // if the verification start message is invalid, send a cancel message to
+    // the other side, and also send a cancellation event
+    const cancel = (err) => {
+        if (handler.verifier) {
+            handler.verifier.cancel(err);
+        } else if (handler.request && handler.request.cancel) {
+            handler.request.cancel(err);
+        }
+        this.sendToDevice(
+            "m.key.verification.cancel", {
+                [sender]: {
+                    [deviceId]: err.getContent(),
+                },
+            },
+        );
+    };
+    if (!this._verificationMethods.has(content.method)) {
+        cancel(newUnknownMethodError({
+            transaction_id: content.transactionId,
+        }));
+        return;
+    } else if (content.next_method) {
+        if (!this._verificationMethods.has(content.next_method)) {
+            cancel(newUnknownMethodError({
+                transaction_id: content.transactionId,
+            }));
+            return;
+        } else {
+            /* TODO:
+            const verification = new TwoPartVerification(
+                this._verificationMethods[content.method],
+                this._verificationMethods[content.next_method],
+                userId, deviceId,
+            );
+            this.emit(verification.event_type, verification);
+            this.emit(verification.first.event_type, verification);*/
+        }
+    } else {
+        const verifier = new (this._verificationMethods.get(content.method))(
+            this._baseApis, sender, deviceId, content.transaction_id,
+            event, handler && handler.request,
+        );
+        if (!handler) {
+            if (!this._verificationTransactions.has(sender)) {
+                this._verificationTransactions.set(sender, new Map());
+            }
+            handler = this._verificationTransactions.get(sender).set(transactionId, {
+                verifier: verifier,
+            });
+        } else {
+            if (!handler.verifier) {
+                handler.verifier = verifier;
+                if (handler.request) {
+                    // the verification start was sent as a response to a
+                    // verification request
+
+                    if (!handler.request.devices.includes(deviceId)) {
+                        // didn't send a request to that device, so it
+                        // shouldn't have responded
+                        cancel(newUnexpectedMessageError({
+                            transaction_id: content.transactionId,
+                        }));
+                        return;
+                    }
+                    if (!handler.request.methods.includes(content.method)) {
+                        // verification method wasn't one that was requested
+                        cancel(newUnknownMethodError({
+                            transaction_id: content.transactionId,
+                        }));
+                        return;
+                    }
+
+                    // send cancellation messages to all the other devices that
+                    // the request was sent to
+                    const message = {
+                        transaction_id: transactionId,
+                        code: "m.accepted",
+                        reason: "Verification request accepted by another device",
+                    };
+                    const msgMap = {};
+                    for (const devId of handler.request.devices) {
+                        if (devId !== deviceId) {
+                            msgMap[devId] = message;
+                        }
+                    }
+                    this._baseApis.sendToDevice("m.key.verification.cancel", {
+                        [sender]: msgMap,
+                    });
+
+                    handler.request.resolve(verifier);
+                }
+            } else {
+                // FIXME: make sure we're in a two-part verification, and the start matches the second part
+            }
+        }
+        this._baseApis.emit("crypto.verification.start", verifier);
+    }
+};
+
+/**
+ * Handle a general key verification event.
+ *
+ * @private
+ * @param {module:models/event.MatrixEvent} event verification start event
+ */
+Crypto.prototype._onKeyVerificationMessage = function(event) {
+    const sender = event.getSender();
+    const transactionId = event.getContent().transaction_id;
+    const handler = this._verificationTransactions.has(sender)
+          && this._verificationTransactions.get(sender).get(transactionId);
+    if (!handler) {
+        return;
+    } else if (event.getType() === "m.key.verification.cancel") {
+        logger.log(event);
+        if (handler.verifier) {
+            handler.verifier.cancel(event);
+        } else if (handler.request && handler.request.cancel) {
+            handler.request.cancel(event);
+        }
+    } else if (handler.verifier) {
+        const verifier = handler.verifier;
+        if (verifier.events
+            && verifier.events.includes(event.getType())) {
+            verifier.handleEvent(event);
+        }
+    }
+};
+
+/**
+ * Handle a toDevice event that couldn't be decrypted
+ *
+ * @private
+ * @param {module:models/event.MatrixEvent} event undecryptable event
+ */
+Crypto.prototype._onToDeviceBadEncrypted = async function(event) {
+    const content = event.getWireContent();
+    const sender = event.getSender();
+    const algorithm = content.algorithm;
+    const deviceKey = content.sender_key;
+
+    if (sender === undefined || deviceKey === undefined || deviceKey === undefined) {
+        return;
+    }
+
+    // check when we last forced a new session with this device: if we've already done so
+    // recently, don't do it again.
+    this._lastNewSessionForced[sender] = this._lastNewSessionForced[sender] || {};
+    const lastNewSessionForced = this._lastNewSessionForced[sender][deviceKey] || 0;
+    if (lastNewSessionForced + MIN_FORCE_SESSION_INTERVAL_MS > Date.now()) {
+        logger.debug(
+            "New session already forced with device " + sender + ":" + deviceKey +
+            " at " + lastNewSessionForced + ": not forcing another",
+        );
+        return;
+    }
+
+    // establish a new olm session with this device since we're failing to decrypt messages
+    // on a current session.
+    // Note that an undecryptable message from another device could easily be spoofed -
+    // is there anything we can do to mitigate this?
+    const device = this._deviceList.getDeviceByIdentityKey(algorithm, deviceKey);
+    if (!device) {
+        logger.info(
+            "Couldn't find device for identity key " + deviceKey +
+            ": not re-establishing session",
+        );
+        return;
+    }
+    const devicesByUser = {};
+    devicesByUser[sender] = [device];
+    await olmlib.ensureOlmSessionsForDevices(
+        this._olmDevice, this._baseApis, devicesByUser, true,
+    );
+
+    this._lastNewSessionForced[sender][deviceKey] = Date.now();
+
+    // Now send a blank message on that session so the other side knows about it.
+    // (The keyshare request is sent in the clear so that won't do)
+    // We send this first such that, as long as the toDevice messages arrive in the
+    // same order we sent them, the other end will get this first, set up the new session,
+    // then get the keyshare request and send the key over this new session (because it
+    // is the session it has most recently received a message on).
+    const encryptedContent = {
+        algorithm: olmlib.OLM_ALGORITHM,
+        sender_key: this._olmDevice.deviceCurve25519Key,
+        ciphertext: {},
+    };
+    await olmlib.encryptMessageForDevice(
+        encryptedContent.ciphertext,
+        this._userId,
+        this._deviceId,
+        this._olmDevice,
+        sender,
+        device,
+        {type: "m.dummy"},
+    );
+
+    await this._baseApis.sendToDevice("m.room.encrypted", {
+        [sender]: {
+            [device.deviceId]: encryptedContent,
+        },
+    });
+
+
+    // Most of the time this probably won't be necessary since we'll have queued up a key request when
+    // we failed to decrypt the message and will be waiting a bit for the key to arrive before sending
+    // it. This won't always be the case though so we need to re-send any that have already been sent
+    // to avoid races.
+    const requestsToResend =
+        await this._outgoingRoomKeyRequestManager.getOutgoingSentRoomKeyRequest(
+            sender, device.deviceId,
+        );
+    for (const keyReq of requestsToResend) {
+        this.requestRoomKey(keyReq.requestBody, keyReq.recipients, true);
+    }
 };
 
 /**
@@ -1287,9 +2138,27 @@ Crypto.prototype._processReceivedRoomKeyRequest = async function(req) {
                 ` for ${roomId} / ${body.session_id} (id ${req.requestId})`);
 
     if (userId !== this._userId) {
-        // TODO: determine if we sent this device the keys already: in
-        // which case we can do so again.
-        logger.log("Ignoring room key request from other user for now");
+        if (!this._roomEncryptors[roomId]) {
+            logger.debug(`room key request for unencrypted room ${roomId}`);
+            return;
+        }
+        const encryptor = this._roomEncryptors[roomId];
+        const device = this._deviceList.getStoredDevice(userId, deviceId);
+        if (!device) {
+            logger.debug(`Ignoring keyshare for unknown device ${userId}:${deviceId}`);
+            return;
+        }
+
+        try {
+            await encryptor.reshareKeyWithDevice(
+                body.sender_key, body.session_id, userId, device,
+            );
+        } catch (e) {
+            logger.warn(
+                "Failed to re-share keys for session " + body.session_id +
+                " with device " + userId + ":" + device.deviceId, e,
+            );
+        }
         return;
     }
 
@@ -1511,17 +2380,6 @@ class IncomingRoomKeyRequestCancellation {
 /**
  * Fires when the app may wish to warn the user about something related
  * the end-to-end crypto.
- *
- * Comes with a type which is one of:
- * * CRYPTO_WARNING_ACCOUNT_MIGRATED: Account data has been migrated from an older
- *       version of the store in such a way that older clients will no longer be
- *       able to read it. The app may wish to warn the user against going back to
- *       an older version of the app.
- * * CRYPTO_WARNING_OLD_VERSION_DETECTED: js-sdk has detected that an older version
- *       of js-sdk has been run against the same store after a migration has been
- *       performed. This is likely have caused unexpected behaviour in the old
- *       version. For example, the old version and the new version may have two
- *       different identity keys.
  *
  * @event module:client~MatrixClient#"crypto.warning"
  * @param {string} type One of the strings listed above

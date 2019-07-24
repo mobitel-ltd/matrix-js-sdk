@@ -249,7 +249,7 @@ RoomMember.prototype.getDMInviter = function() {
  * "crop" or "scale".
  * @param {Boolean} allowDefault (optional) Passing false causes this method to
  * return null if the user has no avatar image. Otherwise, a default image URL
- * will be returned. Default: true.
+ * will be returned. Default: true. (Deprecated)
  * @param {Boolean} allowDirectLinks (optional) If true, the avatar URL will be
  * returned even if it is a direct hyperlink rather than a matrix content URL.
  * If false, any non-matrix content URLs will be ignored. Setting this option to
@@ -298,26 +298,24 @@ function calculateDisplayName(selfUserId, displayName, roomState) {
         return selfUserId;
     }
 
-    if (!roomState) {
-        return displayName;
-    }
-
     // First check if the displayname is something we consider truthy
     // after stripping it of zero width characters and padding spaces
-    const strippedDisplayName = utils.removeHiddenChars(displayName);
-    if (!strippedDisplayName) {
+    if (!utils.removeHiddenChars(displayName)) {
         return selfUserId;
+    }
+
+    if (!roomState) {
+        return displayName;
     }
 
     // Next check if the name contains something that look like a mxid
     // If it does, it may be someone trying to impersonate someone else
     // Show full mxid in this case
-    // Also show mxid if there are other people with the same displayname
-    // ignoring any zero width chars (unicode 200B-200D)
-    // if their displayname is made up of just zero width chars, show full mxid
+    // Also show mxid if there are other people with the same or similar
+    // displayname, after hidden character removal.
     let disambiguate = /@.+:.+/.test(displayName);
     if (!disambiguate) {
-        const userIds = roomState.getUserIdsWithDisplayName(strippedDisplayName);
+        const userIds = roomState.getUserIdsWithDisplayName(displayName);
         disambiguate = userIds.some((u) => u !== selfUserId);
     }
 
