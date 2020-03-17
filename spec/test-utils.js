@@ -1,13 +1,8 @@
-"use strict";
-import expect from 'expect';
-import Promise from 'bluebird';
-
 // load olm before the sdk if possible
 import './olm-loader';
 
-import logger from '../src/logger';
-import sdk from '..';
-const MatrixEvent = sdk.MatrixEvent;
+import {logger} from '../src/logger';
+import {MatrixEvent} from "../src/models/event";
 
 /**
  * Return a promise that is resolved when the client next emits a
@@ -16,7 +11,7 @@ const MatrixEvent = sdk.MatrixEvent;
  * @param {Number=} count Number of syncs to wait for (default 1)
  * @return {Promise} Resolves once the client has emitted a SYNCING event
  */
-module.exports.syncPromise = function(client, count) {
+export function syncPromise(client, count) {
     if (count === undefined) {
         count = 1;
     }
@@ -27,7 +22,7 @@ module.exports.syncPromise = function(client, count) {
     const p = new Promise((resolve, reject) => {
         const cb = (state) => {
             logger.log(`${Date.now()} syncPromise(${count}): ${state}`);
-            if (state == 'SYNCING') {
+            if (state === 'SYNCING') {
                 resolve();
             } else {
                 client.once('sync', cb);
@@ -37,21 +32,9 @@ module.exports.syncPromise = function(client, count) {
     });
 
     return p.then(() => {
-        return module.exports.syncPromise(client, count-1);
+        return syncPromise(client, count-1);
     });
-};
-
-/**
- * Perform common actions before each test case, e.g. printing the test case
- * name to stdout.
- * @param {Mocha.Context} context  The test context
- */
-module.exports.beforeEach = function(context) {
-    const desc = context.currentTest.fullTitle();
-
-    logger.log(desc);
-    logger.log(new Array(1 + desc.length).join("="));
-};
+}
 
 /**
  * Create a spy for an object and automatically spy its methods.
@@ -59,7 +42,7 @@ module.exports.beforeEach = function(context) {
  * @param {string} name The name of the class
  * @return {Object} An instantiated object with spied methods/properties.
  */
-module.exports.mock = function(constr, name) {
+export function mock(constr, name) {
     // Based on
     // http://eclipsesource.com/blogs/2014/03/27/mocks-in-jasmine-tests/
     const HelperConstr = new Function(); // jshint ignore:line
@@ -71,7 +54,7 @@ module.exports.mock = function(constr, name) {
     for (const key in constr.prototype) { // eslint-disable-line guard-for-in
         try {
             if (constr.prototype[key] instanceof Function) {
-                result[key] = expect.createSpy();
+                result[key] = jest.fn();
             }
         } catch (ex) {
             // Direct access to some non-function fields of DOM prototypes may
@@ -80,7 +63,7 @@ module.exports.mock = function(constr, name) {
         }
     }
     return result;
-};
+}
 
 /**
  * Create an Event.
@@ -93,7 +76,7 @@ module.exports.mock = function(constr, name) {
  * @param {boolean} opts.event True to make a MatrixEvent.
  * @return {Object} a JSON object representing this event.
  */
-module.exports.mkEvent = function(opts) {
+export function mkEvent(opts) {
     if (!opts.type || !opts.content) {
         throw new Error("Missing .type or .content =>" + JSON.stringify(opts));
     }
@@ -112,14 +95,14 @@ module.exports.mkEvent = function(opts) {
         event.state_key = "";
     }
     return opts.event ? new MatrixEvent(event) : event;
-};
+}
 
 /**
  * Create an m.presence event.
  * @param {Object} opts Values for the presence.
  * @return {Object|MatrixEvent} The event
  */
-module.exports.mkPresence = function(opts) {
+export function mkPresence(opts) {
     if (!opts.user) {
         throw new Error("Missing user");
     }
@@ -135,7 +118,7 @@ module.exports.mkPresence = function(opts) {
         },
     };
     return opts.event ? new MatrixEvent(event) : event;
-};
+}
 
 /**
  * Create an m.room.member event.
@@ -150,7 +133,7 @@ module.exports.mkPresence = function(opts) {
  * @param {boolean} opts.event True to make a MatrixEvent.
  * @return {Object|MatrixEvent} The event
  */
-module.exports.mkMembership = function(opts) {
+export function mkMembership(opts) {
     opts.type = "m.room.member";
     if (!opts.skey) {
         opts.skey = opts.sender || opts.user;
@@ -167,8 +150,8 @@ module.exports.mkMembership = function(opts) {
     if (opts.url) {
         opts.content.avatar_url = opts.url;
     }
-    return module.exports.mkEvent(opts);
-};
+    return mkEvent(opts);
+}
 
 /**
  * Create an m.room.message event.
@@ -179,7 +162,7 @@ module.exports.mkMembership = function(opts) {
  * @param {boolean} opts.event True to make a MatrixEvent.
  * @return {Object|MatrixEvent} The event
  */
-module.exports.mkMessage = function(opts) {
+export function mkMessage(opts) {
     opts.type = "m.room.message";
     if (!opts.msg) {
         opts.msg = "Random->" + Math.random();
@@ -191,8 +174,8 @@ module.exports.mkMessage = function(opts) {
         msgtype: "m.text",
         body: opts.msg,
     };
-    return module.exports.mkEvent(opts);
-};
+    return mkEvent(opts);
+}
 
 
 /**
@@ -200,10 +183,10 @@ module.exports.mkMessage = function(opts) {
  *
  * @constructor
  */
-module.exports.MockStorageApi = function() {
+export function MockStorageApi() {
     this.data = {};
-};
-module.exports.MockStorageApi.prototype = {
+}
+MockStorageApi.prototype = {
     get length() {
         return Object.keys(this.data).length;
     },
@@ -228,7 +211,7 @@ module.exports.MockStorageApi.prototype = {
  * @param {MatrixEvent} event
  * @returns {Promise} promise which resolves (to `event`) when the event has been decrypted
  */
-module.exports.awaitDecryption = function(event) {
+export function awaitDecryption(event) {
     if (!event.isBeingDecrypted()) {
         return Promise.resolve(event);
     }
@@ -241,4 +224,145 @@ module.exports.awaitDecryption = function(event) {
             resolve(ev);
         });
     });
+}
+
+
+export function HttpResponse(
+    httpLookups, acceptKeepalives, ignoreUnhandledSync,
+) {
+    this.httpLookups = httpLookups;
+    this.acceptKeepalives = acceptKeepalives === undefined ? true : acceptKeepalives;
+    this.ignoreUnhandledSync = ignoreUnhandledSync;
+    this.pendingLookup = null;
+}
+
+HttpResponse.prototype.request = function(
+    cb, method, path, qp, data, prefix,
+) {
+    if (path === HttpResponse.KEEP_ALIVE_PATH && this.acceptKeepalives) {
+        return Promise.resolve();
+    }
+    const next = this.httpLookups.shift();
+    const logLine = (
+        "MatrixClient[UT] RECV " + method + " " + path + "  " +
+            "EXPECT " + (next ? next.method : next) + " " + (next ? next.path : next)
+    );
+    logger.log(logLine);
+
+    if (!next) { // no more things to return
+        if (method === "GET" && path === "/sync" && this.ignoreUnhandledSync) {
+            logger.log("MatrixClient[UT] Ignoring.");
+            return new Promise(() => {});
+        }
+        if (this.pendingLookup) {
+            if (this.pendingLookup.method === method
+                && this.pendingLookup.path === path) {
+                return this.pendingLookup.promise;
+            }
+            // >1 pending thing, and they are different, whine.
+            expect(false).toBe(
+                true, ">1 pending request. You should probably handle them. " +
+                    "PENDING: " + JSON.stringify(this.pendingLookup) + " JUST GOT: " +
+                    method + " " + path,
+            );
+        }
+        this.pendingLookup = {
+            promise: new Promise(() => {}),
+            method: method,
+            path: path,
+        };
+        return this.pendingLookup.promise;
+    }
+    if (next.path === path && next.method === method) {
+        logger.log(
+            "MatrixClient[UT] Matched. Returning " +
+                (next.error ? "BAD" : "GOOD") + " response",
+        );
+        if (next.expectBody) {
+            expect(next.expectBody).toEqual(data);
+        }
+        if (next.expectQueryParams) {
+            Object.keys(next.expectQueryParams).forEach(function(k) {
+                expect(qp[k]).toEqual(next.expectQueryParams[k]);
+            });
+        }
+
+        if (next.thenCall) {
+            process.nextTick(next.thenCall, 0); // next tick so we return first.
+        }
+
+        if (next.error) {
+            return Promise.reject({
+                errcode: next.error.errcode,
+                httpStatus: next.error.httpStatus,
+                name: next.error.errcode,
+                message: "Expected testing error",
+                data: next.error,
+            });
+        }
+        return Promise.resolve(next.data);
+    } else if (method === "GET" && path === "/sync" && this.ignoreUnhandledSync) {
+        logger.log("MatrixClient[UT] Ignoring.");
+        this.httpLookups.unshift(next);
+        return new Promise(() => {});
+    }
+    expect(true).toBe(false, "Expected different request. " + logLine);
+    return new Promise(() => {});
 };
+
+HttpResponse.KEEP_ALIVE_PATH = "/_matrix/client/versions";
+
+HttpResponse.PUSH_RULES_RESPONSE = {
+    method: "GET",
+    path: "/pushrules/",
+    data: {},
+};
+
+HttpResponse.USER_ID = "@alice:bar";
+
+HttpResponse.filterResponse = function(userId) {
+    const filterPath = "/user/" + encodeURIComponent(userId) + "/filter";
+    return {
+        method: "POST",
+        path: filterPath,
+        data: { filter_id: "f1lt3r" },
+    };
+};
+
+HttpResponse.SYNC_DATA = {
+    next_batch: "s_5_3",
+    presence: { events: [] },
+    rooms: {},
+};
+
+HttpResponse.SYNC_RESPONSE = {
+    method: "GET",
+    path: "/sync",
+    data: HttpResponse.SYNC_DATA,
+};
+
+HttpResponse.defaultResponses = function(userId) {
+    return [
+        HttpResponse.PUSH_RULES_RESPONSE,
+        HttpResponse.filterResponse(userId),
+        HttpResponse.SYNC_RESPONSE,
+    ];
+};
+
+export function setHttpResponses(
+    client, responses, acceptKeepalives, ignoreUnhandledSyncs,
+) {
+    const httpResponseObj = new HttpResponse(
+        responses, acceptKeepalives, ignoreUnhandledSyncs,
+    );
+
+    const httpReq = httpResponseObj.request.bind(httpResponseObj);
+    client._http = [
+        "authedRequest", "authedRequestWithPrefix", "getContentUri",
+        "request", "requestWithPrefix", "uploadContent",
+    ].reduce((r, k) => {r[k] = jest.fn(); return r;}, {});
+    client._http.authedRequest.mockImplementation(httpReq);
+    client._http.authedRequestWithPrefix.mockImplementation(httpReq);
+    client._http.requestWithPrefix.mockImplementation(httpReq);
+    client._http.request.mockImplementation(httpReq);
+}

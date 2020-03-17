@@ -1,16 +1,9 @@
-"use strict";
-import 'source-map-support/register';
-const sdk = require("../..");
-const HttpBackend = require("matrix-mock-request");
-const utils = require("../test-utils");
-const MatrixEvent = sdk.MatrixEvent;
-const EventTimeline = sdk.EventTimeline;
-
-import expect from 'expect';
-import Promise from 'bluebird';
+import {MatrixEvent} from "../../src/models/event";
+import {EventTimeline} from "../../src/models/event-timeline";
+import * as utils from "../test-utils";
+import {TestClient} from "../TestClient";
 
 describe("MatrixClient syncing", function() {
-    const baseUrl = "http://localhost.or.something";
     let client = null;
     let httpBackend = null;
     const selfUserId = "@alice:localhost";
@@ -23,14 +16,9 @@ describe("MatrixClient syncing", function() {
     const roomTwo = "!bar:localhost";
 
     beforeEach(function() {
-        utils.beforeEach(this); // eslint-disable-line babel/no-invalid-this
-        httpBackend = new HttpBackend();
-        sdk.request(httpBackend.requestFn);
-        client = sdk.createClient({
-            baseUrl: baseUrl,
-            userId: selfUserId,
-            accessToken: selfAccessToken,
-        });
+        const testClient = new TestClient(selfUserId, "DEVICE", selfAccessToken);
+        httpBackend = testClient.httpBackend;
+        client = testClient.client;
         httpBackend.when("GET", "/pushrules").respond(200, {});
         httpBackend.when("POST", "/filter").respond(200, { filter_id: "a filter id" });
     });
@@ -53,7 +41,7 @@ describe("MatrixClient syncing", function() {
 
             client.startClient();
 
-            httpBackend.flushAllExpected().done(function() {
+            httpBackend.flushAllExpected().then(function() {
                 done();
             });
         });
@@ -67,7 +55,7 @@ describe("MatrixClient syncing", function() {
 
             client.startClient();
 
-            httpBackend.flushAllExpected().done(function() {
+            httpBackend.flushAllExpected().then(function() {
                 done();
             });
         });
@@ -528,7 +516,7 @@ describe("MatrixClient syncing", function() {
                 awaitSyncEvent(),
             ]).then(function() {
                 const room = client.getRoom(roomTwo);
-                expect(room).toExist();
+                expect(room).toBeDefined();
                 const tok = room.getLiveTimeline()
                     .getPaginationToken(EventTimeline.BACKWARDS);
                 expect(tok).toEqual("roomtwotok");
@@ -693,12 +681,12 @@ describe("MatrixClient syncing", function() {
                             include_leave: true }});
             }).respond(200, { filter_id: "another_id" });
 
-            const defer = Promise.defer();
-
-            httpBackend.when("GET", "/sync").check(function(req) {
-                expect(req.queryParams.filter).toEqual("another_id");
-                defer.resolve();
-            }).respond(200, {});
+            const prom = new Promise((resolve) => {
+                httpBackend.when("GET", "/sync").check(function(req) {
+                    expect(req.queryParams.filter).toEqual("another_id");
+                    resolve();
+                }).respond(200, {});
+            });
 
             client.syncLeftRooms();
 
@@ -709,7 +697,7 @@ describe("MatrixClient syncing", function() {
                     // flush the syncs
                     return httpBackend.flushAllExpected();
                 }),
-                defer.promise,
+                prom,
             ]);
         });
 

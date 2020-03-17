@@ -1,5 +1,6 @@
 /*
 Copyright 2018 New Vector Ltd
+Copyright 2019 The Matrix.org Foundation C.I.C.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,24 +14,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-"use strict";
 
-import 'source-map-support/register';
-import Promise from 'bluebird';
-const sdk = require("../..");
-const utils = require("../test-utils");
-
-const AutoDiscovery = sdk.AutoDiscovery;
-
-import expect from 'expect';
 import MockHttpBackend from "matrix-mock-request";
-
+import * as sdk from "../../src";
+import {AutoDiscovery} from "../../src/autodiscovery";
 
 describe("AutoDiscovery", function() {
     let httpBackend = null;
 
     beforeEach(function() {
-        utils.beforeEach(this); // eslint-disable-line babel/no-invalid-this
         httpBackend = new MockHttpBackend();
         sdk.request(httpBackend.requestFn);
     });
@@ -416,8 +408,8 @@ describe("AutoDiscovery", function() {
         ]);
     });
 
-    it("should return FAIL_ERROR when the identity server configuration is wrong " +
-        "(missing base_url)", function() {
+    it("should return SUCCESS / FAIL_PROMPT when the identity server configuration " +
+        "is wrong (missing base_url)", function() {
         httpBackend.when("GET", "/_matrix/client/versions").check((req) => {
             expect(req.opts.uri)
                 .toEqual("https://chat.example.org/_matrix/client/versions");
@@ -438,14 +430,14 @@ describe("AutoDiscovery", function() {
             AutoDiscovery.findClientConfig("example.org").then((conf) => {
                 const expected = {
                     "m.homeserver": {
-                        state: "FAIL_ERROR",
-                        error: AutoDiscovery.ERROR_INVALID_IS,
+                        state: "SUCCESS",
+                        error: null,
 
                         // We still expect the base_url to be here for debugging purposes.
                         base_url: "https://chat.example.org",
                     },
                     "m.identity_server": {
-                        state: "FAIL_ERROR",
+                        state: "FAIL_PROMPT",
                         error: AutoDiscovery.ERROR_INVALID_IS_BASE_URL,
                         base_url: null,
                     },
@@ -456,8 +448,8 @@ describe("AutoDiscovery", function() {
         ]);
     });
 
-    it("should return FAIL_ERROR when the identity server configuration is wrong " +
-        "(empty base_url)", function() {
+    it("should return SUCCESS / FAIL_PROMPT when the identity server configuration " +
+        "is wrong (empty base_url)", function() {
         httpBackend.when("GET", "/_matrix/client/versions").check((req) => {
             expect(req.opts.uri)
                 .toEqual("https://chat.example.org/_matrix/client/versions");
@@ -478,14 +470,14 @@ describe("AutoDiscovery", function() {
             AutoDiscovery.findClientConfig("example.org").then((conf) => {
                 const expected = {
                     "m.homeserver": {
-                        state: "FAIL_ERROR",
-                        error: AutoDiscovery.ERROR_INVALID_IS,
+                        state: "SUCCESS",
+                        error: null,
 
                         // We still expect the base_url to be here for debugging purposes.
                         base_url: "https://chat.example.org",
                     },
                     "m.identity_server": {
-                        state: "FAIL_ERROR",
+                        state: "FAIL_PROMPT",
                         error: AutoDiscovery.ERROR_INVALID_IS_BASE_URL,
                         base_url: null,
                     },
@@ -496,8 +488,8 @@ describe("AutoDiscovery", function() {
         ]);
     });
 
-    it("should return FAIL_ERROR when the identity server configuration is wrong " +
-        "(validation error: 404)", function() {
+    it("should return SUCCESS / FAIL_PROMPT when the identity server configuration " +
+        "is wrong (validation error: 404)", function() {
         httpBackend.when("GET", "/_matrix/client/versions").check((req) => {
             expect(req.opts.uri)
                 .toEqual("https://chat.example.org/_matrix/client/versions");
@@ -519,14 +511,14 @@ describe("AutoDiscovery", function() {
             AutoDiscovery.findClientConfig("example.org").then((conf) => {
                 const expected = {
                     "m.homeserver": {
-                        state: "FAIL_ERROR",
-                        error: AutoDiscovery.ERROR_INVALID_IS,
+                        state: "SUCCESS",
+                        error: null,
 
                         // We still expect the base_url to be here for debugging purposes.
                         base_url: "https://chat.example.org",
                     },
                     "m.identity_server": {
-                        state: "FAIL_ERROR",
+                        state: "FAIL_PROMPT",
                         error: AutoDiscovery.ERROR_INVALID_IDENTITY_SERVER,
                         base_url: "https://identity.example.org",
                     },
@@ -537,8 +529,8 @@ describe("AutoDiscovery", function() {
         ]);
     });
 
-    it("should return FAIL_ERROR when the identity server configuration is wrong " +
-        "(validation error: 500)", function() {
+    it("should return SUCCESS / FAIL_PROMPT when the identity server configuration " +
+        "is wrong (validation error: 500)", function() {
         httpBackend.when("GET", "/_matrix/client/versions").check((req) => {
             expect(req.opts.uri)
                 .toEqual("https://chat.example.org/_matrix/client/versions");
@@ -560,14 +552,14 @@ describe("AutoDiscovery", function() {
             AutoDiscovery.findClientConfig("example.org").then((conf) => {
                 const expected = {
                     "m.homeserver": {
-                        state: "FAIL_ERROR",
-                        error: AutoDiscovery.ERROR_INVALID_IS,
+                        state: "SUCCESS",
+                        error: null,
 
                         // We still expect the base_url to be here for debugging purposes
                         base_url: "https://chat.example.org",
                     },
                     "m.identity_server": {
-                        state: "FAIL_ERROR",
+                        state: "FAIL_PROMPT",
                         error: AutoDiscovery.ERROR_INVALID_IDENTITY_SERVER,
                         base_url: "https://identity.example.org",
                     },

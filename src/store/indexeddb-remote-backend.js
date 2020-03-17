@@ -1,6 +1,7 @@
 /*
 Copyright 2017 Vector Creations Ltd
 Copyright 2018 New Vector Ltd
+Copyright 2019 The Matrix.org Foundation C.I.C.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,8 +16,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Promise from 'bluebird';
-import logger from '../../src/logger';
+import {logger} from '../logger';
+import {defer} from '../utils';
 
 /**
  * An IndexedDB store backend where the actual backend sits in a web
@@ -30,7 +31,7 @@ import logger from '../../src/logger';
  * to open the same database.
  * @param {Object} workerApi The web worker compatible interface object
  */
-const RemoteIndexedDBStoreBackend = function RemoteIndexedDBStoreBackend(
+export function RemoteIndexedDBStoreBackend(
     workerScript, dbName, workerApi,
 ) {
     this._workerScript = workerScript;
@@ -45,7 +46,7 @@ const RemoteIndexedDBStoreBackend = function RemoteIndexedDBStoreBackend(
     // Once we start connecting, we keep the promise and re-use it
     // if we try to connect again
     this._startPromise = null;
-};
+}
 
 
 RemoteIndexedDBStoreBackend.prototype = {
@@ -152,7 +153,7 @@ RemoteIndexedDBStoreBackend.prototype = {
         // the promise automatically gets rejected
         return Promise.resolve().then(() => {
             const seq = this._nextSeq++;
-            const def = Promise.defer();
+            const def = defer();
 
             this._inFlight[seq] = def;
 
@@ -194,5 +195,3 @@ RemoteIndexedDBStoreBackend.prototype = {
         }
     },
 };
-
-export default RemoteIndexedDBStoreBackend;

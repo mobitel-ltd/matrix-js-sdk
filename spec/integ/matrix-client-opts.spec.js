@@ -1,12 +1,8 @@
-"use strict";
-import 'source-map-support/register';
-const sdk = require("../..");
-const MatrixClient = sdk.MatrixClient;
-const HttpBackend = require("matrix-mock-request");
-const utils = require("../test-utils");
-
-import expect from 'expect';
-import Promise from 'bluebird';
+import * as utils from "../test-utils";
+import HttpBackend from "matrix-mock-request";
+import {MatrixClient} from "../../src/matrix";
+import {MatrixScheduler} from "../../src/scheduler";
+import {MemoryStore} from "../../src/store/memory";
 
 describe("MatrixClient opts", function() {
     const baseUrl = "http://localhost.or.something";
@@ -58,7 +54,6 @@ describe("MatrixClient opts", function() {
     };
 
     beforeEach(function() {
-        utils.beforeEach(this); // eslint-disable-line babel/no-invalid-this
         httpBackend = new HttpBackend();
     });
 
@@ -75,7 +70,7 @@ describe("MatrixClient opts", function() {
                 baseUrl: baseUrl,
                 userId: userId,
                 accessToken: accessToken,
-                scheduler: new sdk.MatrixScheduler(),
+                scheduler: new MatrixScheduler(),
             });
         });
 
@@ -88,7 +83,7 @@ describe("MatrixClient opts", function() {
             httpBackend.when("PUT", "/txn1").respond(200, {
                 event_id: eventId,
             });
-            client.sendTextMessage("!foo:bar", "a body", "txn1").done(function(res) {
+            client.sendTextMessage("!foo:bar", "a body", "txn1").then(function(res) {
                 expect(res.event_id).toEqual(eventId);
                 done();
             });
@@ -101,7 +96,7 @@ describe("MatrixClient opts", function() {
                 "m.room.create",
             ];
             client.on("event", function(event) {
-                expect(expectedEventTypes.indexOf(event.getType())).toNotEqual(
+                expect(expectedEventTypes.indexOf(event.getType())).not.toEqual(
                     -1, "Recv unexpected event type: " + event.getType(),
                 );
                 expectedEventTypes.splice(
@@ -128,7 +123,7 @@ describe("MatrixClient opts", function() {
         beforeEach(function() {
             client = new MatrixClient({
                 request: httpBackend.requestFn,
-                store: new sdk.MemoryStore(),
+                store: new MemoryStore(),
                 baseUrl: baseUrl,
                 userId: userId,
                 accessToken: accessToken,
@@ -141,7 +136,7 @@ describe("MatrixClient opts", function() {
                 errcode: "M_SOMETHING",
                 error: "Ruh roh",
             });
-            client.sendTextMessage("!foo:bar", "a body", "txn1").done(function(res) {
+            client.sendTextMessage("!foo:bar", "a body", "txn1").then(function(res) {
                 expect(false).toBe(true, "sendTextMessage resolved but shouldn't");
             }, function(err) {
                 expect(err.errcode).toEqual("M_SOMETHING");
@@ -159,16 +154,16 @@ describe("MatrixClient opts", function() {
             });
             let sentA = false;
             let sentB = false;
-            client.sendTextMessage("!foo:bar", "a body", "txn1").done(function(res) {
+            client.sendTextMessage("!foo:bar", "a body", "txn1").then(function(res) {
                 sentA = true;
                 expect(sentB).toBe(true);
             });
-            client.sendTextMessage("!foo:bar", "b body", "txn2").done(function(res) {
+            client.sendTextMessage("!foo:bar", "b body", "txn2").then(function(res) {
                 sentB = true;
                 expect(sentA).toBe(false);
             });
-            httpBackend.flush("/txn2", 1).done(function() {
-                httpBackend.flush("/txn1", 1).done(function() {
+            httpBackend.flush("/txn2", 1).then(function() {
+                httpBackend.flush("/txn1", 1).then(function() {
                     done();
                 });
             });
@@ -178,7 +173,7 @@ describe("MatrixClient opts", function() {
             httpBackend.when("PUT", "/txn1").respond(200, {
                 event_id: "foo",
             });
-            client.sendTextMessage("!foo:bar", "a body", "txn1").done(function(res) {
+            client.sendTextMessage("!foo:bar", "a body", "txn1").then(function(res) {
                 expect(res.event_id).toEqual("foo");
                 done();
             });

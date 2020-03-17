@@ -1,6 +1,7 @@
 /*
 Copyright 2017 Vector Creations Ltd
 Copyright 2018 New Vector Ltd
+Copyright 2019 The Matrix.org Foundation C.I.C.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,11 +16,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Promise from 'bluebird';
-import SyncAccumulator from "../sync-accumulator";
-import utils from "../utils";
+import {SyncAccumulator} from "../sync-accumulator";
+import * as utils from "../utils";
 import * as IndexedDBHelpers from "../indexeddb-helpers";
-import logger from '../../src/logger';
+import {logger} from '../logger';
 
 const VERSION = 3;
 
@@ -123,7 +123,7 @@ function reqAsCursorPromise(req) {
  * @param {string=} dbName Optional database name. The same name must be used
  * to open the same database.
  */
-const LocalIndexedDBStoreBackend = function LocalIndexedDBStoreBackend(
+export function LocalIndexedDBStoreBackend(
     indexedDBInterface, dbName,
 ) {
     this.indexedDB = indexedDBInterface;
@@ -132,7 +132,7 @@ const LocalIndexedDBStoreBackend = function LocalIndexedDBStoreBackend(
     this._disconnected = true;
     this._syncAccumulator = new SyncAccumulator();
     this._isNewlyCreated = false;
-};
+}
 
 LocalIndexedDBStoreBackend.exists = function(indexedDB, dbName) {
     dbName = "matrix-js-sdk:" + (dbName || "default");
@@ -436,7 +436,7 @@ LocalIndexedDBStoreBackend.prototype = {
      */
     _persistSyncData: function(nextBatch, roomsData, groupsData) {
         logger.log("Persisting sync data up to ", nextBatch);
-        return Promise.try(() => {
+        return utils.promiseTry(() => {
             const txn = this.db.transaction(["sync"], "readwrite");
             const store = txn.objectStore("sync");
             store.put({
@@ -456,7 +456,7 @@ LocalIndexedDBStoreBackend.prototype = {
      * @return {Promise} Resolves if the events were persisted.
      */
     _persistAccountData: function(accountData) {
-        return Promise.try(() => {
+        return utils.promiseTry(() => {
             const txn = this.db.transaction(["accountData"], "readwrite");
             const store = txn.objectStore("accountData");
             for (let i = 0; i < accountData.length; i++) {
@@ -475,7 +475,7 @@ LocalIndexedDBStoreBackend.prototype = {
      * @return {Promise} Resolves if the users were persisted.
      */
     _persistUserPresenceEvents: function(tuples) {
-        return Promise.try(() => {
+        return utils.promiseTry(() => {
             const txn = this.db.transaction(["users"], "readwrite");
             const store = txn.objectStore("users");
             for (const tuple of tuples) {
@@ -495,7 +495,7 @@ LocalIndexedDBStoreBackend.prototype = {
      * @return {Promise<Object[]>} A list of presence events in their raw form.
      */
     getUserPresenceEvents: function() {
-        return Promise.try(() => {
+        return utils.promiseTry(() => {
             const txn = this.db.transaction(["users"], "readonly");
             const store = txn.objectStore("users");
             return selectQuery(store, undefined, (cursor) => {
@@ -512,7 +512,7 @@ LocalIndexedDBStoreBackend.prototype = {
         logger.log(
             `LocalIndexedDBStoreBackend: loading account data...`,
         );
-        return Promise.try(() => {
+        return utils.promiseTry(() => {
             const txn = this.db.transaction(["accountData"], "readonly");
             const store = txn.objectStore("accountData");
             return selectQuery(store, undefined, (cursor) => {
@@ -534,7 +534,7 @@ LocalIndexedDBStoreBackend.prototype = {
         logger.log(
             `LocalIndexedDBStoreBackend: loading sync data...`,
         );
-        return Promise.try(() => {
+        return utils.promiseTry(() => {
             const txn = this.db.transaction(["sync"], "readonly");
             const store = txn.objectStore("sync");
             return selectQuery(store, undefined, (cursor) => {
@@ -573,5 +573,3 @@ LocalIndexedDBStoreBackend.prototype = {
         await txnAsPromise(txn);
     },
 };
-
-export default LocalIndexedDBStoreBackend;

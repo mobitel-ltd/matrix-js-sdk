@@ -9,11 +9,15 @@ Quickstart
 
 In a browser
 ------------
-Download either the full or minified version from
+Download the browser version from
 https://github.com/matrix-org/matrix-js-sdk/releases/latest and add that as a
 ``<script>`` to your page. There will be a global variable ``matrixcs``
 attached to ``window`` through which you can access the SDK. See below for how to
 include libolm to enable end-to-end-encryption.
+
+The browser bundle supports recent versions of browsers. Typically this is ES2015
+or `> 0.5%, last 2 versions, Firefox ESR, not dead` if using 
+[browserlists](https://github.com/browserslist/browserslist).
 
 Please check [the working browser example](examples/browser) for more information.
 
@@ -22,13 +26,18 @@ In Node.js
 
 Ensure you have the latest LTS version of Node.js installed.
 
-Using `yarn` instead of `npm` is recommended. Please see the Yarn [install guide](https://yarnpkg.com/docs/install/) if you do not have it already.
+This SDK targets Node 10 for compatibility, which translates to ES6. If you're using
+a bundler like webpack you'll likely have to transpile dependencies, including this
+SDK, to match your target browsers.
+
+Using `yarn` instead of `npm` is recommended. Please see the Yarn [install guide](https://yarnpkg.com/docs/install/) 
+if you do not have it already.
 
 ``yarn add matrix-js-sdk``
 
 ```javascript
-  var sdk = require("matrix-js-sdk");
-  var client = sdk.createClient("https://matrix.org");
+  import * as sdk from "matrix-js-sdk";
+  const client = sdk.createClient("https://matrix.org");
   client.publicRooms(function(err, data) {
     console.log("Public Rooms: %s", JSON.stringify(data));
   });
@@ -59,7 +68,7 @@ client.once('sync', function(state, prevState, res) {
 To send a message:
 
 ```javascript
-var content = {
+const content = {
     "body": "message text",
     "msgtype": "m.text"
 };
@@ -161,7 +170,7 @@ which will be fulfilled in the future.
 The typical usage is something like:
 
 ```javascript
-  matrixClient.someMethod(arg1, arg2).done(function(result) {
+  matrixClient.someMethod(arg1, arg2).then(function(result) {
     ...
   });
 ```
@@ -191,10 +200,10 @@ This section provides some useful code snippets which demonstrate the
 core functionality of the SDK. These examples assume the SDK is setup like this:
 
 ```javascript
-   var sdk = require("matrix-js-sdk");
-   var myUserId = "@example:localhost";
-   var myAccessToken = "QGV4YW1wbGU6bG9jYWxob3N0.qPEvLuYfNBjxikiCjP";
-   var matrixClient = sdk.createClient({
+   import * as sdk from "matrix-js-sdk";
+   const myUserId = "@example:localhost";
+   const myAccessToken = "QGV4YW1wbGU6bG9jYWxob3N0.qPEvLuYfNBjxikiCjP";
+   const matrixClient = sdk.createClient({
        baseUrl: "http://localhost:8008",
        accessToken: myAccessToken,
        userId: myUserId
@@ -206,7 +215,7 @@ core functionality of the SDK. These examples assume the SDK is setup like this:
 ```javascript
    matrixClient.on("RoomMember.membership", function(event, member) {
        if (member.membership === "invite" && member.userId === myUserId) {
-           matrixClient.joinRoom(member.roomId).done(function() {
+           matrixClient.joinRoom(member.roomId).then(function() {
                console.log("Auto-joined %s", member.roomId);
            });
        }
@@ -247,11 +256,11 @@ Output:
 
 ```javascript
    matrixClient.on("RoomState.members", function(event, state, member) {
-       var room = matrixClient.getRoom(state.roomId);
+       const room = matrixClient.getRoom(state.roomId);
        if (!room) {
            return;
        }
-       var memberList = state.getMembers();
+       const memberList = state.getMembers();
        console.log(room.name);
        console.log(Array(room.name.length + 1).join("="));  // underline
        for (var i = 0; i < memberList.length; i++) {
@@ -297,7 +306,7 @@ End-to-end encryption support
 =============================
 
 The SDK supports end-to-end encryption via the Olm and Megolm protocols, using
-[libolm](https://gitlab.matrix.org/matrix-org/olm). It is left up to the 
+[libolm](https://gitlab.matrix.org/matrix-org/olm). It is left up to the
 application to make libolm available, via the ``Olm`` global.
 
 It is also necessry to call ``matrixClient.initCrypto()`` after creating a new
@@ -319,16 +328,16 @@ To provide the Olm library in a browser application:
 
  * download the transpiled libolm (from https://packages.matrix.org/npm/olm/).
  * load ``olm.js`` as a ``<script>`` *before* ``browser-matrix.js``.
- 
+
 To provide the Olm library in a node.js application:
 
- * ``yarn add https://packages.matrix.org/npm/olm/olm-3.0.0.tgz``
+ * ``yarn add https://packages.matrix.org/npm/olm/olm-3.1.4.tgz``
    (replace the URL with the latest version you want to use from
     https://packages.matrix.org/npm/olm/)
  * ``global.Olm = require('olm');`` *before* loading ``matrix-js-sdk``.
 
 If you want to package Olm as dependency for your node.js application, you can
-use ``yarn add https://packages.matrix.org/npm/olm/olm-3.0.0.tgz``. If your
+use ``yarn add https://packages.matrix.org/npm/olm/olm-3.1.4.tgz``. If your
 application also works without e2e crypto enabled, add ``--optional`` to mark it
 as an optional dependency.
 
@@ -349,11 +358,6 @@ Building
 To build a browser version from scratch when developing::
 ```
  $ yarn build
-```
-
-To constantly do builds when files are modified (using ``watchify``)::
-```
- $ yarn watch
 ```
 
 To run tests (Jasmine)::

@@ -16,51 +16,41 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-"use strict";
 
-const PushProcessor = require('./pushprocessor');
 
 /**
  * This is an internal module. See {@link MatrixClient} for the public class.
  * @module client
  */
-const EventEmitter = require("events").EventEmitter;
-import Promise from 'bluebird';
-const url = require('url');
 
-const httpApi = require("./http-api");
-const MatrixEvent = require("./models/event").MatrixEvent;
-const EventStatus = require("./models/event").EventStatus;
-const EventTimeline = require("./models/event-timeline");
-const SearchResult = require("./models/search-result");
-const StubStore = require("./store/stub");
-const webRtcCall = require("./webrtc/call");
-const utils = require("./utils");
-const contentRepo = require("./content-repo");
-const Filter = require("./filter");
-const SyncApi = require("./sync");
-const MatrixBaseApis = require("./base-apis");
-const MatrixError = httpApi.MatrixError;
-const ContentHelpers = require("./content-helpers");
-const olmlib = require("./crypto/olmlib");
-
-import ReEmitter from './ReEmitter';
-import RoomList from './crypto/RoomList';
-import logger from '../src/logger';
-
-import Crypto from './crypto';
-import { isCryptoAvailable } from './crypto';
-import { encodeRecoveryKey, decodeRecoveryKey } from './crypto/recoverykey';
-import { keyForNewBackup, keyForExistingBackup } from './crypto/backup_password';
-import { randomString } from './randomstring';
-
-// Disable warnings for now: we use deprecated bluebird functions
-// and need to migrate, but they spam the console with warnings.
-Promise.config({warnings: false});
-
+import url from "url";
+import {EventEmitter} from "events";
+import {MatrixBaseApis} from "./base-apis";
+import {Filter} from "./filter";
+import {SyncApi} from "./sync";
+import {EventStatus, MatrixEvent} from "./models/event";
+import {EventTimeline} from "./models/event-timeline";
+import {SearchResult} from "./models/search-result";
+import {StubStore} from "./store/stub";
+import {createNewMatrixCall} from "./webrtc/call";
+import * as utils from './utils';
+import {sleep} from './utils';
+import {MatrixError, PREFIX_MEDIA_R0, PREFIX_UNSTABLE} from "./http-api";
+import {getHttpUriForMxc} from "./content-repo";
+import * as ContentHelpers from "./content-helpers";
+import * as olmlib from "./crypto/olmlib";
+import {ReEmitter} from './ReEmitter';
+import {RoomList} from './crypto/RoomList';
+import {logger} from './logger';
+import {Crypto, isCryptoAvailable} from './crypto';
+import {decodeRecoveryKey} from './crypto/recoverykey';
+import {keyFromAuthData} from './crypto/key_passphrase';
+import {randomString} from './randomstring';
+import {PushProcessor} from "./pushprocessor";
+import {encodeBase64, decodeBase64} from "./crypto/olmlib";
 
 const SCROLLBACK_DELAY_MS = 3000;
-const CRYPTO_ENABLED = isCryptoAvailable();
+export const CRYPTO_ENABLED = isCryptoAvailable();
 const CAPABILITIES_CACHE_MS = 21600000; // 6 hours - an arbitrary value
 
 function keysFromRecoverySession(sessions, decryptionKey, roomId) {
@@ -72,7 +62,7 @@ function keysFromRecoverySession(sessions, decryptionKey, roomId) {
             decrypted.room_id = roomId;
             keys.push(decrypted);
         } catch (e) {
-            logger.log("Failed to decrypt session from backup");
+            logger.log("Failed to decrypt megolm session from backup", e);
         }
     }
     return keys;
@@ -107,6 +97,21 @@ function keyFromRecoverySession(session, decryptionKey) {
  * @param {string} opts.accessToken The access_token for this user.
  *
  * @param {string} opts.userId The user ID for this user.
+ *
+ * @param {Object} opts.deviceToImport Device data exported with
+ *     "exportDevice" method that must be imported to recreate this device.
+ *     Should only be useful for devices with end-to-end crypto enabled.
+ *     If provided, opts.deviceId and opts.userId should **NOT** be provided
+ *     (they are present in the exported data).
+ *
+ * @param {IdentityServerProvider} [opts.identityServer]
+ * Optional. A provider object with one function `getAccessToken`, which is a
+ * callback that returns a Promise<String> of an identity access token to supply
+ * with identity requests. If the object is unset, no access token will be
+ * supplied.
+ * See also https://github.com/vector-im/riot-web/issues/10615 which seeks to
+ * replace the previous approach of manual access tokens params with this
+ * callback throughout the SDK.
  *
  * @param {Object=} opts.store
  *    The data store used for sync data from the homeserver. If not specified,
@@ -159,17 +164,81 @@ function keyFromRecoverySession(session, decryptionKey) {
  * that the application can handle.  Each element should be an item from {@link
  * module:crypto~verificationMethods verificationMethods}, or a class that
  * implements the {$link module:crypto/verification/Base verifier interface}.
+ *
+ * @param {boolean} [opts.forceTURN]
+ * Optional. Whether relaying calls through a TURN server should be forced.
+ *
+ * @param {boolean} [opts.fallbackICEServerAllowed]
+ * Optional. Whether to allow a fallback ICE server should be used for negotiating a
+ * WebRTC connection if the homeserver doesn't provide any servers. Defaults to false.
+ *
+ * @param {object} opts.cryptoCallbacks Optional. Callbacks for crypto and cross-signing.
+ *     The cross-signing API is currently UNSTABLE and may change without notice.
+ *
+ * @param {function} [opts.cryptoCallbacks.getCrossSigningKey]
+ * Optional. Function to call when a cross-signing private key is needed.
+ * Secure Secret Storage will be used by default if this is unset.
+ * Args:
+ *    {string} type The type of key needed.  Will be one of "master",
+ *      "self_signing", or "user_signing"
+ *    {Uint8Array} publicKey The public key matching the expected private key.
+ *        This can be passed to checkPrivateKey() along with the private key
+ *        in order to check that a given private key matches what is being
+ *        requested.
+ *   Should return a promise that resolves with the private key as a
+ *   UInt8Array or rejects with an error.
+ *
+ * @param {function} [opts.cryptoCallbacks.saveCrossSigningKeys]
+ * Optional. Called when new private keys for cross-signing need to be saved.
+ * Secure Secret Storage will be used by default if this is unset.
+ * Args:
+ *   {object} keys the private keys to save. Map of key name to private key
+ *       as a UInt8Array. The getPrivateKey callback above will be called
+ *       with the corresponding key name when the keys are required again.
+ *
+ * @param {function} [opts.cryptoCallbacks.shouldUpgradeDeviceVerifications]
+ * Optional. Called when there are device-to-device verifications that can be
+ * upgraded into cross-signing verifications.
+ * Args:
+ *   {object} users The users whose device verifications can be
+ *     upgraded to cross-signing verifications.  This will be a map of user IDs
+ *     to objects with the properties `devices` (array of the user's devices
+ *     that verified their cross-signing key), and `crossSigningInfo` (the
+ *     user's cross-signing information)
+ * Should return a promise which resolves with an array of the user IDs who
+ * should be cross-signed.
+ *
+ * @param {function} [opts.cryptoCallbacks.getSecretStorageKey]
+ * Optional. Function called when an encryption key for secret storage
+ *     is required. One or more keys will be described in the keys object.
+ *     The callback function should return a promise with an array of:
+ *     [<key name>, <UInt8Array private key>] or null if it cannot provide
+ *     any of the keys.
+ * Args:
+ *   {object} keys Information about the keys:
+ *       {
+ *           <key name>: {
+ *               pubkey: {UInt8Array}
+ *           }
+ *       }
+ *   {string} name the name of the value we want to read out of SSSS, for UI purposes.
+ *
+ * @param {function} [opts.cryptoCallbacks.onSecretRequested]
+ * Optional. Function called when a request for a secret is received from another
+ * device.
+ * Args:
+ *   {string} name The name of the secret being requested.
+ *   {string} user_id (string) The user ID of the client requesting
+ *   {string} device_id The device ID of the client requesting the secret.
+ *   {string} request_id The ID of the request. Used to match a
+ *     corresponding `crypto.secrets.request_cancelled`. The request ID will be
+ *     unique per sender, device pair.
+ *   {DeviceTrustLevel} device_trust: The trust status of the device requesting
+ *     the secret as returned by {@link module:client~MatrixClient#checkDeviceTrust}.
  */
-function MatrixClient(opts) {
-    // Allow trailing slash in HS url
-    if (opts.baseUrl && opts.baseUrl.endsWith("/")) {
-        opts.baseUrl = opts.baseUrl.substr(0, opts.baseUrl.length - 1);
-    }
-
-    // Allow trailing slash in IS url
-    if (opts.idBaseUrl && opts.idBaseUrl.endsWith("/")) {
-        opts.idBaseUrl = opts.idBaseUrl.substr(0, opts.idBaseUrl.length - 1);
-    }
+export function MatrixClient(opts) {
+    opts.baseUrl = utils.ensureNoTrailingSlash(opts.baseUrl);
+    opts.idBaseUrl = utils.ensureNoTrailingSlash(opts.idBaseUrl);
 
     MatrixBaseApis.call(this, opts);
 
@@ -185,6 +254,29 @@ function MatrixClient(opts) {
     this.credentials = {
         userId: userId,
     };
+
+    if (opts.deviceToImport) {
+        if (this.deviceId) {
+            logger.warn(
+                'not importing device because'
+                + ' device ID is provided to constructor'
+                + ' independently of exported data',
+            );
+        } else if (this.credentials.userId) {
+            logger.warn(
+                'not importing device because'
+                + ' user ID is provided to constructor'
+                + ' independently of exported data',
+            );
+        } else if (!(opts.deviceToImport.deviceId)) {
+            logger.warn('not importing device because no device ID in exported data');
+        } else {
+            this.deviceId = opts.deviceToImport.deviceId;
+            this.credentials.userId = opts.deviceToImport.userId;
+            // will be used during async initialization of the crypto
+            this._exportedOlmDeviceToImport = opts.deviceToImport.olmDevice;
+        }
+    }
 
     this.scheduler = opts.scheduler;
     if (this.scheduler) {
@@ -206,7 +298,7 @@ function MatrixClient(opts) {
 
     // try constructing a MatrixCall to see if we are running in an environment
     // which has WebRTC. If we are, listen for and handle m.call.* events.
-    const call = webRtcCall.createNewMatrixCall(this);
+    const call = createNewMatrixCall(this);
     this._supportsVoip = false;
     if (call) {
         setupCallEventHandler(this);
@@ -226,8 +318,10 @@ function MatrixClient(opts) {
     this._cryptoStore = opts.cryptoStore;
     this._sessionStore = opts.sessionStore;
     this._verificationMethods = opts.verificationMethods;
+    this._cryptoCallbacks = opts.cryptoCallbacks || {};
 
     this._forceTURN = opts.forceTURN || false;
+    this._fallbackICEServerAllowed = opts.fallbackICEServerAllowed || false;
 
     // List of which rooms have encryption enabled: separate from crypto because
     // we still want to know which rooms are encrypted even if crypto is disabled:
@@ -237,7 +331,9 @@ function MatrixClient(opts) {
     // The pushprocessor caches useful things, so keep one and re-use it
     this._pushProcessor = new PushProcessor(this);
 
-    this._serverSupportsLazyLoading = null;
+    // Cache of the server's /versions response
+    // TODO: This should expire: https://github.com/matrix-org/matrix-js-sdk/issues/1020
+    this._serverVersionsCache = null;
 
     this._cachedCapabilities = null; // { capabilities: {}, lastUpdated: timestamp }
 
@@ -324,6 +420,18 @@ function MatrixClient(opts) {
 }
 utils.inherits(MatrixClient, EventEmitter);
 utils.extend(MatrixClient.prototype, MatrixBaseApis.prototype);
+
+MatrixClient.prototype.exportDevice = async function() {
+    if (!(this._crypto)) {
+        logger.warn('not exporting device if crypto is not enabled');
+        return;
+    }
+    return {
+        userId: this.credentials.userId,
+        deviceId: this.deviceId,
+        olmDevice: await this._crypto._olmDevice.export(),
+    };
+};
 
 /**
  * Clear any data out of the persistent stores used by the client.
@@ -433,6 +541,18 @@ MatrixClient.prototype.getSyncStateData = function() {
 };
 
 /**
+ * Whether the initial sync has completed.
+ * @return {boolean} True if at least on sync has happened.
+ */
+MatrixClient.prototype.isInitialSyncComplete = function() {
+    const state = this.getSyncState();
+    if (!state) {
+        return false;
+    }
+    return state === "PREPARED" || state === "SYNCING";
+};
+
+/**
  * Return whether the client is configured for a guest account.
  * @return {boolean} True if this is a guest access_token (or no token is supplied).
  */
@@ -492,7 +612,7 @@ MatrixClient.prototype.setNotifTimelineSet = function(notifTimelineSet) {
  * Gets the capabilities of the homeserver. Always returns an object of
  * capability keys and their options, which may be empty.
  * @param {boolean} fresh True to ignore any cached values.
- * @return {module:client.Promise} Resolves to the capabilities of the homeserver
+ * @return {Promise} Resolves to the capabilities of the homeserver
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.getCapabilities = function(fresh=false) {
@@ -599,10 +719,17 @@ MatrixClient.prototype.initCrypto = async function() {
         "crypto.roomKeyRequest",
         "crypto.roomKeyRequestCancellation",
         "crypto.warning",
+        "crypto.devicesUpdated",
+        "deviceVerificationChanged",
+        "userTrustStatusChanged",
+        "crossSigning.keysChanged",
     ]);
 
     logger.log("Crypto: initialising crypto object...");
-    await crypto.init();
+    await crypto.init({
+        exportedOlmDevice: this._exportedOlmDeviceToImport,
+    });
+    delete this._exportedOlmDeviceToImport;
 
     this.olmVersion = Crypto.getOlmVersion();
 
@@ -634,6 +761,19 @@ MatrixClient.prototype.getDeviceEd25519Key = function() {
         return null;
     }
     return this._crypto.getDeviceEd25519Key();
+};
+
+/**
+ * Get the Curve25519 key for this device
+ *
+ * @return {?string} base64-encoded curve25519 key. Null if crypto is
+ *    disabled.
+ */
+MatrixClient.prototype.getDeviceCurve25519Key = function() {
+    if (!this._crypto) {
+        return null;
+    }
+    return this._crypto.getDeviceCurve25519Key();
 };
 
 /**
@@ -669,7 +809,7 @@ MatrixClient.prototype.downloadKeys = function(userIds, forceDownload) {
  *
  * @param {string} userId the user to list keys for.
  *
- * @return {Promise<module:crypto-deviceinfo[]>} list of devices
+ * @return {Promise<module:crypto/deviceinfo[]>} list of devices
  */
 MatrixClient.prototype.getStoredDevicesForUser = async function(userId) {
     if (this._crypto === null) {
@@ -684,7 +824,7 @@ MatrixClient.prototype.getStoredDevicesForUser = async function(userId) {
  * @param {string} userId the user to list keys for.
  * @param {string} deviceId unique identifier for the device
  *
- * @return {Promise<?module:crypto-deviceinfo>} device or null
+ * @return {Promise<?module:crypto/deviceinfo>} device or null
  */
 MatrixClient.prototype.getStoredDevice = async function(userId, deviceId) {
     if (this._crypto === null) {
@@ -697,7 +837,8 @@ MatrixClient.prototype.getStoredDevice = async function(userId, deviceId) {
  * Mark the given device as verified
  *
  * @param {string} userId owner of the device
- * @param {string} deviceId unique identifier for the device
+ * @param {string} deviceId unique identifier for the device or user's
+ * cross-signing public key ID.
  *
  * @param {boolean=} verified whether to mark the device as verified. defaults
  *   to 'true'.
@@ -725,7 +866,8 @@ MatrixClient.prototype.setDeviceVerified = function(userId, deviceId, verified) 
  * Mark the given device as blocked/unblocked
  *
  * @param {string} userId owner of the device
- * @param {string} deviceId unique identifier for the device
+ * @param {string} deviceId unique identifier for the device or user's
+ * cross-signing public key ID.
  *
  * @param {boolean=} blocked whether to mark the device as blocked. defaults
  *   to 'true'.
@@ -745,7 +887,8 @@ MatrixClient.prototype.setDeviceBlocked = function(userId, deviceId, blocked) {
  * Mark the given device as known/unknown
  *
  * @param {string} userId owner of the device
- * @param {string} deviceId unique identifier for the device
+ * @param {string} deviceId unique identifier for the device or user's
+ * cross-signing public key ID.
  *
  * @param {boolean=} known whether to mark the device as known. defaults
  *   to 'true'.
@@ -767,29 +910,56 @@ async function _setDeviceVerification(
     if (!client._crypto) {
         throw new Error("End-to-End encryption disabled");
     }
-    const dev = await client._crypto.setDeviceVerification(
+    await client._crypto.setDeviceVerification(
         userId, deviceId, verified, blocked, known,
     );
-    client.emit("deviceVerificationChanged", userId, deviceId, dev);
 }
+
+/**
+ * Request a key verification from another user, using a DM.
+ *
+ * @param {string} userId the user to request verification with
+ * @param {string} roomId the room to use for verification
+ *
+ * @returns {Promise<module:crypto/verification/request/VerificationRequest>} resolves to a VerificationRequest
+ *    when the request has been sent to the other party.
+ */
+MatrixClient.prototype.requestVerificationDM = function(userId, roomId) {
+    if (this._crypto === null) {
+        throw new Error("End-to-end encryption disabled");
+    }
+    return this._crypto.requestVerificationDM(userId, roomId);
+};
+
+/**
+ * Finds a DM verification request that is already in progress for the given room id
+ *
+ * @param {string} roomId the room to use for verification
+ *
+ * @returns {module:crypto/verification/request/VerificationRequest?} the VerificationRequest that is in progress, if any
+ */
+MatrixClient.prototype.findVerificationRequestDMInProgress = function(roomId) {
+    if (this._crypto === null) {
+        throw new Error("End-to-end encryption disabled");
+    }
+    return this._crypto.findVerificationRequestDMInProgress(roomId);
+};
 
 /**
  * Request a key verification from another user.
  *
  * @param {string} userId the user to request verification with
- * @param {Array} methods array of verification methods to use.  Defaults to
- *    all known methods
  * @param {Array} devices array of device IDs to send requests to.  Defaults to
  *    all devices owned by the user
  *
- * @returns {Promise<module:crypto/verification/Base>} resolves to a verifier
- *    when the request is accepted by the other user
+ * @returns {Promise<module:crypto/verification/request/VerificationRequest>} resolves to a VerificationRequest
+ *    when the request has been sent to the other party.
  */
-MatrixClient.prototype.requestVerification = function(userId, methods, devices) {
+MatrixClient.prototype.requestVerification = function(userId, devices) {
     if (this._crypto === null) {
         throw new Error("End-to-end encryption disabled");
     }
-    return this._crypto.requestVerification(userId, methods, devices);
+    return this._crypto.requestVerification(userId, devices);
 };
 
 /**
@@ -833,6 +1003,289 @@ MatrixClient.prototype.getGlobalBlacklistUnverifiedDevices = function() {
     }
     return this._crypto.getGlobalBlacklistUnverifiedDevices();
 };
+
+/**
+ * Set whether sendMessage in a room with unknown and unverified devices
+ * should throw an error and not send them message. This has 'Global' for
+ * symmetry with setGlobalBlacklistUnverifiedDevices but there is currently
+ * no room-level equivalent for this setting.
+ *
+ * This API is currently UNSTABLE and may change or be removed without notice.
+ *
+ * @param {boolean} value whether error on unknown devices
+ */
+MatrixClient.prototype.setGlobalErrorOnUnknownDevices = function(value) {
+    if (this._crypto === null) {
+        throw new Error("End-to-end encryption disabled");
+    }
+    this._crypto.setGlobalErrorOnUnknownDevices(value);
+};
+
+/**
+ * @return {boolean} whether to error on unknown devices
+ *
+ * This API is currently UNSTABLE and may change or be removed without notice.
+ */
+MatrixClient.prototype.getGlobalErrorOnUnknownDevices = function() {
+    if (this._crypto === null) {
+        throw new Error("End-to-end encryption disabled");
+    }
+    return this._crypto.getGlobalErrorOnUnknownDevices();
+};
+
+/**
+ * Add methods that call the corresponding method in this._crypto
+ *
+ * @param {class} MatrixClient the class to add the method to
+ * @param {string} names the names of the methods to call
+ */
+function wrapCryptoFuncs(MatrixClient, names) {
+    for (const name of names) {
+        MatrixClient.prototype[name] = function(...args) {
+            if (!this._crypto) { // eslint-disable-line no-invalid-this
+                throw new Error("End-to-end encryption disabled");
+            }
+
+            return this._crypto[name](...args); // eslint-disable-line no-invalid-this
+        };
+    }
+}
+
+ /**
+ * Generate new cross-signing keys.
+ * The cross-signing API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#resetCrossSigningKeys
+ * @param {object} authDict Auth data to supply for User-Interactive auth.
+ * @param {CrossSigningLevel} [level] the level of cross-signing to reset.  New
+ * keys will be created for the given level and below.  Defaults to
+ * regenerating all keys.
+ */
+
+/**
+ * Get the user's cross-signing key ID.
+ * The cross-signing API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#getCrossSigningId
+ * @param {string} [type=master] The type of key to get the ID of.  One of
+ *     "master", "self_signing", or "user_signing".  Defaults to "master".
+ *
+ * @returns {string} the key ID
+ */
+
+/**
+ * Get the cross signing information for a given user.
+ * The cross-signing API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#getStoredCrossSigningForUser
+ * @param {string} userId the user ID to get the cross-signing info for.
+ *
+ * @returns {CrossSigningInfo} the cross signing information for the user.
+ */
+
+/**
+ * Check whether a given user is trusted.
+ * The cross-signing API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#checkUserTrust
+ * @param {string} userId The ID of the user to check.
+ *
+ * @returns {UserTrustLevel}
+ */
+
+/**
+ * Check whether a given device is trusted.
+ * The cross-signing API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#checkDeviceTrust
+ * @param {string} userId The ID of the user whose devices is to be checked.
+ * @param {string} deviceId The ID of the device to check
+ *
+ * @returns {DeviceTrustLevel}
+ */
+
+/**
+ * Check the copy of our cross-signing key that we have in the device list and
+ * see if we can get the private key. If so, mark it as trusted.
+ * The cross-signing API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#checkOwnCrossSigningTrust
+ */
+
+/**
+ * Checks that a given cross-signing private key matches a given public key.
+ * This can be used by the getCrossSigningKey callback to verify that the
+ * private key it is about to supply is the one that was requested.
+ * The cross-signing API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#checkCrossSigningPrivateKey
+ * @param {Uint8Array} privateKey The private key
+ * @param {string} expectedPublicKey The public key
+ * @returns {boolean} true if the key matches, otherwise false
+ */
+
+wrapCryptoFuncs(MatrixClient, [
+    "resetCrossSigningKeys",
+    "getCrossSigningId",
+    "getStoredCrossSigningForUser",
+    "checkUserTrust",
+    "checkDeviceTrust",
+    "checkOwnCrossSigningTrust",
+    "checkCrossSigningPrivateKey",
+]);
+
+/**
+ * Check if the sender of an event is verified
+ * The cross-signing API is currently UNSTABLE and may change without notice.
+ *
+ * @param {MatrixEvent} event event to be checked
+ *
+ * @returns {DeviceTrustLevel}
+ */
+MatrixClient.prototype.checkEventSenderTrust = async function(event) {
+    const device = await this.getEventSenderDeviceInfo(event);
+    if (!device) {
+        return 0;
+    }
+    return await this._crypto.checkDeviceTrust(event.getSender(), device.deviceId);
+};
+
+/**
+ * Create a recovery key from a user-supplied passphrase.
+ * The Secure Secret Storage API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#createRecoveryKeyFromPassphrase
+ * @param {string} password Passphrase string that can be entered by the user
+ *     when restoring the backup as an alternative to entering the recovery key.
+ *     Optional.
+ * @returns {Promise<String>} The user-facing recovery key string.
+ */
+
+/**
+ * Bootstrap Secure Secret Storage if needed by creating a default key and signing it with
+ * the cross-signing master key. If everything is already set up, then no
+ * changes are made, so this is safe to run to ensure secret storage is ready
+ * for use.
+ * The Secure Secret Storage API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#bootstrapSecretStorage
+ * @param {function} [opts.authUploadDeviceSigningKeys] Optional. Function
+ * called to await an interactive auth flow when uploading device signing keys.
+ * Args:
+ *     {function} A function that makes the request requiring auth. Receives the
+ *     auth data as an object.
+ */
+
+/**
+ * Add a key for encrypting secrets.
+ * The Secure Secret Storage API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#addSecretStorageKey
+ * @param {string} algorithm the algorithm used by the key
+ * @param {object} opts the options for the algorithm.  The properties used
+ *     depend on the algorithm given.
+ * @param {string} [keyName] the name of the key.  If not given, a random
+ *     name will be generated.
+ *
+ * @return {string} the name of the key
+ */
+
+/**
+ * Check whether we have a key with a given ID.
+ * The Secure Secret Storage API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#hasSecretStorageKey
+ * @param {string} [keyId = default key's ID] The ID of the key to check
+ *     for. Defaults to the default key ID if not provided.
+ * @return {boolean} Whether we have the key.
+ */
+
+/**
+ * Store an encrypted secret on the server
+ * The Secure Secret Storage API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#storeSecret
+ * @param {string} name The name of the secret
+ * @param {string} secret The secret contents.
+ * @param {Array} keys The IDs of the keys to use to encrypt the secret or null/undefined
+ *     to use the default (will throw if no default key is set).
+ */
+
+/**
+ * Get a secret from storage.
+ * The Secure Secret Storage API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#getSecret
+ * @param {string} name the name of the secret
+ *
+ * @return {string} the contents of the secret
+ */
+
+/**
+ * Check if a secret is stored on the server.
+ * The Secure Secret Storage API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#isSecretStored
+ * @param {string} name the name of the secret
+ * @param {boolean} checkKey check if the secret is encrypted by a trusted
+ *     key
+ *
+ * @return {boolean} whether or not the secret is stored
+ */
+
+/**
+ * Request a secret from another device.
+ * The Secure Secret Storage API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#requestSecret
+ * @param {string} name the name of the secret to request
+ * @param {string[]} devices the devices to request the secret from
+ *
+ * @return {string} the contents of the secret
+ */
+
+/**
+ * Get the current default key ID for encrypting secrets.
+ * The Secure Secret Storage API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#getDefaultSecretStorageKeyId
+ *
+ * @return {string} The default key ID or null if no default key ID is set
+ */
+
+/**
+ * Set the current default key ID for encrypting secrets.
+ * The Secure Secret Storage API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#setDefaultSecretStorageKeyId
+ * @param {string} keyId The new default key ID
+ */
+
+/**
+ * Checks that a given secret storage private key matches a given public key.
+ * This can be used by the getSecretStorageKey callback to verify that the
+ * private key it is about to supply is the one that was requested.
+ * The Secure Secret Storage API is currently UNSTABLE and may change without notice.
+ *
+ * @function module:client~MatrixClient#checkSecretStoragePrivateKey
+ * @param {Uint8Array} privateKey The private key
+ * @param {string} expectedPublicKey The public key
+ * @returns {boolean} true if the key matches, otherwise false
+ */
+
+wrapCryptoFuncs(MatrixClient, [
+    "createRecoveryKeyFromPassphrase",
+    "bootstrapSecretStorage",
+    "addSecretStorageKey",
+    "hasSecretStorageKey",
+    "storeSecret",
+    "getSecret",
+    "isSecretStored",
+    "requestSecret",
+    "getDefaultSecretStorageKeyId",
+    "setDefaultSecretStorageKeyId",
+    "checkSecretStoragePrivateKey",
+]);
 
 /**
  * Get e2e information on the device that sent an event
@@ -935,7 +1388,7 @@ MatrixClient.prototype.forceDiscardSession = function(roomId) {
  *
  * This should be encrypted before returning it to the user.
  *
- * @return {module:client.Promise} a promise which resolves to a list of
+ * @return {Promise} a promise which resolves to a list of
  *    session export objects
  */
 MatrixClient.prototype.exportRoomKeys = function() {
@@ -950,7 +1403,7 @@ MatrixClient.prototype.exportRoomKeys = function() {
  *
  * @param {Object[]} keys a list of session export objects
  *
- * @return {module:client.Promise} a promise which resolves when the keys
+ * @return {Promise} a promise which resolves when the keys
  *    have been imported
  */
 MatrixClient.prototype.importRoomKeys = function(keys) {
@@ -980,7 +1433,7 @@ MatrixClient.prototype.checkKeyBackup = function() {
 MatrixClient.prototype.getKeyBackupVersion = function() {
     return this._http.authedRequest(
         undefined, "GET", "/room_keys/version", undefined, undefined,
-        {prefix: httpApi.PREFIX_UNSTABLE},
+        {prefix: PREFIX_UNSTABLE},
     ).then((res) => {
         if (res.algorithm !== olmlib.MEGOLM_BACKUP_ALGORITHM) {
             const err = "Unknown backup algorithm: " + res.algorithm;
@@ -1071,38 +1524,50 @@ MatrixClient.prototype.disableKeyBackup = function() {
  * @param {string} password Passphrase string that can be entered by the user
  *     when restoring the backup as an alternative to entering the recovery key.
  *     Optional.
+ * @param {boolean} [opts.secureSecretStorage = false] Whether to use Secure
+ *     Secret Storage to store the key encrypting key backups.
+ *     Optional, defaults to false.
  *
  * @returns {Promise<object>} Object that can be passed to createKeyBackupVersion and
  *     additionally has a 'recovery_key' member with the user-facing recovery key string.
  */
-MatrixClient.prototype.prepareKeyBackupVersion = async function(password) {
+MatrixClient.prototype.prepareKeyBackupVersion = async function(
+    password,
+    { secureSecretStorage = false } = {},
+) {
     if (this._crypto === null) {
         throw new Error("End-to-end encryption disabled");
     }
 
-    const decryption = new global.Olm.PkDecryption();
-    try {
-        let publicKey;
-        const authData = {};
-        if (password) {
-            const keyInfo = await keyForNewBackup(password);
-            publicKey = decryption.init_with_private_key(keyInfo.key);
-            authData.private_key_salt = keyInfo.salt;
-            authData.private_key_iterations = keyInfo.iterations;
-        } else {
-            publicKey = decryption.generate_key();
-        }
+    const [keyInfo, encodedPrivateKey, privateKey] =
+        await this.createRecoveryKeyFromPassphrase(password);
 
-        authData.public_key = publicKey;
-
-        return {
-            algorithm: olmlib.MEGOLM_BACKUP_ALGORITHM,
-            auth_data: authData,
-            recovery_key: encodeRecoveryKey(decryption.get_private_key()),
-        };
-    } finally {
-        decryption.free();
+    if (secureSecretStorage) {
+        await this.storeSecret("m.megolm_backup.v1", encodeBase64(privateKey));
+        logger.info("Key backup private key stored in secret storage");
     }
+
+    // Reshape objects into form expected for key backup
+    const authData = {
+        public_key: keyInfo.pubkey,
+    };
+    if (keyInfo.passphrase) {
+        authData.private_key_salt = keyInfo.passphrase.salt;
+        authData.private_key_iterations = keyInfo.passphrase.iterations;
+    }
+    return {
+        algorithm: olmlib.MEGOLM_BACKUP_ALGORITHM,
+        auth_data: authData,
+        recovery_key: encodedPrivateKey,
+    };
+};
+
+/**
+ * Check whether the key backup private key is stored in secret storage.
+ * @return {Promise<boolean>} Whether the backup key is stored.
+ */
+MatrixClient.prototype.isKeyBackupKeyStored = async function() {
+    return this.isSecretStored("m.megolm_backup.v1", false /* checkKey */);
 };
 
 /**
@@ -1112,7 +1577,7 @@ MatrixClient.prototype.prepareKeyBackupVersion = async function(password) {
  * @param {object} info Info object from prepareKeyBackupVersion
  * @returns {Promise<object>} Object with 'version' param indicating the version created
  */
-MatrixClient.prototype.createKeyBackupVersion = function(info) {
+MatrixClient.prototype.createKeyBackupVersion = async function(info) {
     if (this._crypto === null) {
         throw new Error("End-to-end encryption disabled");
     }
@@ -1121,19 +1586,37 @@ MatrixClient.prototype.createKeyBackupVersion = function(info) {
         algorithm: info.algorithm,
         auth_data: info.auth_data,
     };
-    return this._crypto._signObject(data.auth_data).then(() => {
-        return this._http.authedRequest(
-            undefined, "POST", "/room_keys/version", undefined, data,
-            {prefix: httpApi.PREFIX_UNSTABLE},
-        );
-    }).then((res) => {
-        this.enableKeyBackup({
-            algorithm: info.algorithm,
-            auth_data: info.auth_data,
-            version: res.version,
-        });
-        return res;
-    });
+
+    // Sign the backup auth data with the device key for backwards compat with
+    // older devices with cross-signing. This can probably go away very soon in
+    // favour of just signing with the cross-singing master key.
+    await this._crypto._signObject(data.auth_data);
+
+    if (
+        this._cryptoCallbacks.getCrossSigningKey &&
+        this._crypto._crossSigningInfo.getId()
+    ) {
+        // now also sign the auth data with the cross-signing master key
+        // we check for the callback explicitly here because we still want to be able
+        // to create an un-cross-signed key backup if there is a cross-signing key but
+        // no callback supplied.
+        await this._crypto._crossSigningInfo.signObject(data.auth_data, "master");
+    }
+
+    const res = await this._http.authedRequest(
+        undefined, "POST", "/room_keys/version", undefined, data,
+        {prefix: PREFIX_UNSTABLE},
+    );
+
+    // We could assume everything's okay and enable directly, but this ensures
+    // we run the same signature verification that will be used for future
+    // sessions.
+    await this.checkKeyBackup();
+    if (!this.getKeyBackupEnabled()) {
+        logger.error("Key backup not usable even though we just created it");
+    }
+
+    return res;
 };
 
 MatrixClient.prototype.deleteKeyBackupVersion = function(version) {
@@ -1154,7 +1637,7 @@ MatrixClient.prototype.deleteKeyBackupVersion = function(version) {
 
     return this._http.authedRequest(
         undefined, "DELETE", path, undefined, undefined,
-        {prefix: httpApi.PREFIX_UNSTABLE},
+        {prefix: PREFIX_UNSTABLE},
     );
 };
 
@@ -1185,7 +1668,7 @@ MatrixClient.prototype._makeKeyBackupPath = function(roomId, sessionId, version)
  * @param {string} sessionId ID of the session that the keys are for Optional.
  * @param {integer} version backup version Optional.
  * @param {object} data Object keys to send
- * @return {module:client.Promise} a promise that will resolve when the keys
+ * @return {Promise} a promise that will resolve when the keys
  * are uploaded
  */
 MatrixClient.prototype.sendKeyBackup = function(roomId, sessionId, version, data) {
@@ -1196,7 +1679,7 @@ MatrixClient.prototype.sendKeyBackup = function(roomId, sessionId, version, data
     const path = this._makeKeyBackupPath(roomId, sessionId, version);
     return this._http.authedRequest(
         undefined, "PUT", path.path, path.queryData, data,
-        {prefix: httpApi.PREFIX_UNSTABLE},
+        {prefix: PREFIX_UNSTABLE},
     );
 };
 
@@ -1236,15 +1719,60 @@ MatrixClient.prototype.isValidRecoveryKey = function(recoveryKey) {
 
 MatrixClient.RESTORE_BACKUP_ERROR_BAD_KEY = 'RESTORE_BACKUP_ERROR_BAD_KEY';
 
+/**
+ * Restore from an existing key backup via a passphrase.
+ *
+ * @param {string} password Passphrase
+ * @param {string} [targetRoomId] Room ID to target a specific room.
+ * Restores all rooms if omitted.
+ * @param {string} [targetSessionId] Session ID to target a specific session.
+ * Restores all sessions if omitted.
+ * @param {object} backupInfo Backup metadata from `checkKeyBackup`
+ * @return {Promise<object>} Status of restoration with `total` and `imported`
+ * key counts.
+ */
 MatrixClient.prototype.restoreKeyBackupWithPassword = async function(
     password, targetRoomId, targetSessionId, backupInfo,
 ) {
-    const privKey = await keyForExistingBackup(backupInfo, password);
+    const privKey = await keyFromAuthData(backupInfo.auth_data, password);
     return this._restoreKeyBackup(
         privKey, targetRoomId, targetSessionId, backupInfo,
     );
 };
 
+/**
+ * Restore from an existing key backup via a private key stored in secret
+ * storage.
+ *
+ * @param {object} backupInfo Backup metadata from `checkKeyBackup`
+ * @param {string} [targetRoomId] Room ID to target a specific room.
+ * Restores all rooms if omitted.
+ * @param {string} [targetSessionId] Session ID to target a specific session.
+ * Restores all sessions if omitted.
+ * @return {Promise<object>} Status of restoration with `total` and `imported`
+ * key counts.
+ */
+MatrixClient.prototype.restoreKeyBackupWithSecretStorage = async function(
+    backupInfo, targetRoomId, targetSessionId,
+) {
+    const privKey = decodeBase64(await this.getSecret("m.megolm_backup.v1"));
+    return this._restoreKeyBackup(
+        privKey, targetRoomId, targetSessionId, backupInfo,
+    );
+};
+
+/**
+ * Restore from an existing key backup via an encoded recovery key.
+ *
+ * @param {string} recoveryKey Encoded recovery key
+ * @param {string} [targetRoomId] Room ID to target a specific room.
+ * Restores all rooms if omitted.
+ * @param {string} [targetSessionId] Session ID to target a specific session.
+ * Restores all sessions if omitted.
+ * @param {object} backupInfo Backup metadata from `checkKeyBackup`
+ * @return {Promise<object>} Status of restoration with `total` and `imported`
+ * key counts.
+ */
 MatrixClient.prototype.restoreKeyBackupWithRecoveryKey = function(
     recoveryKey, targetRoomId, targetSessionId, backupInfo,
 ) {
@@ -1285,7 +1813,7 @@ MatrixClient.prototype._restoreKeyBackup = function(
 
     return this._http.authedRequest(
         undefined, "GET", path.path, path.queryData, undefined,
-        {prefix: httpApi.PREFIX_UNSTABLE},
+        {prefix: PREFIX_UNSTABLE},
     ).then((res) => {
         if (res.rooms) {
             for (const [roomId, roomData] of Object.entries(res.rooms)) {
@@ -1293,7 +1821,7 @@ MatrixClient.prototype._restoreKeyBackup = function(
 
                 totalKeyCount += Object.keys(roomData.sessions).length;
                 const roomKeys = keysFromRecoverySession(
-                    roomData.sessions, decryption, roomId, roomKeys,
+                    roomData.sessions, decryption, roomId,
                 );
                 for (const k of roomKeys) {
                     k.room_id = roomId;
@@ -1313,7 +1841,7 @@ MatrixClient.prototype._restoreKeyBackup = function(
                 key.session_id = targetSessionId;
                 keys.push(key);
             } catch (e) {
-                logger.log("Failed to decrypt session from backup");
+                logger.log("Failed to decrypt megolm session from backup", e);
             }
         }
 
@@ -1335,7 +1863,7 @@ MatrixClient.prototype.deleteKeysFromBackup = function(roomId, sessionId, versio
     const path = this._makeKeyBackupPath(roomId, sessionId, version);
     return this._http.authedRequest(
         undefined, "DELETE", path.path, path.queryData, undefined,
-        {prefix: httpApi.PREFIX_UNSTABLE},
+        {prefix: PREFIX_UNSTABLE},
     );
 };
 
@@ -1366,11 +1894,13 @@ MatrixClient.prototype.getGroups = function() {
 /**
  * Get the config for the media repository.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves with an object containing the config.
+ * @return {Promise} Resolves with an object containing the config.
  */
 MatrixClient.prototype.getMediaConfig = function(callback) {
-    return this._http.authedRequestWithPrefix(
-        callback, "GET", "/config", undefined, undefined, httpApi.PREFIX_MEDIA_R0,
+    return this._http.authedRequest(
+        callback, "GET", "/config", undefined, undefined, {
+            prefix: PREFIX_MEDIA_R0,
+        },
     );
 };
 
@@ -1454,7 +1984,7 @@ MatrixClient.prototype.getUsers = function() {
  * @param {string} eventType The event type
  * @param {Object} contents the contents object for the event
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.setAccountData = function(eventType, contents, callback) {
@@ -1477,6 +2007,34 @@ MatrixClient.prototype.getAccountData = function(eventType) {
 };
 
 /**
+ * Get account data event of given type for the current user. This variant
+ * gets account data directly from the homeserver if the local store is not
+ * ready, which can be useful very early in startup before the initial sync.
+ * @param {string} eventType The event type
+ * @return {Promise} Resolves: The contents of the given account
+ * data event.
+ * @return {module:http-api.MatrixError} Rejects: with an error response.
+ */
+MatrixClient.prototype.getAccountDataFromServer = async function(eventType) {
+    if (this.isInitialSyncComplete()) {
+        const event = this.store.getAccountData(eventType);
+        if (!event) {
+            return null;
+        }
+        // The network version below returns just the content, so this branch
+        // does the same to match.
+        return event.getContent();
+    }
+    const path = utils.encodeUri("/user/$userId/account_data/$type", {
+        $userId: this.credentials.userId,
+        $type: eventType,
+    });
+    return this._http.authedRequest(
+        undefined, "GET", path, undefined,
+    );
+};
+
+/**
  * Gets the users that are ignored by this client
  * @returns {string[]} The array of users that are ignored (empty if none)
  */
@@ -1490,7 +2048,7 @@ MatrixClient.prototype.getIgnoredUsers = function() {
  * Sets the users that the current user should ignore.
  * @param {string[]} userIds the user IDs to ignore
  * @param {module:client.callback} [callback] Optional.
- * @return {module:client.Promise} Resolves: Account data event
+ * @return {Promise} Resolves: Account data event
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.setIgnoredUsers = function(userIds, callback) {
@@ -1523,7 +2081,7 @@ MatrixClient.prototype.isUserIgnored = function(userId) {
  * @param {string[]} opts.viaServers The server names to try and join through in
  *                                   addition to those that are automatically chosen.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: Room object.
+ * @return {Promise} Resolves: Room object.
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.joinRoom = function(roomIdOrAlias, opts, callback) {
@@ -1557,33 +2115,33 @@ MatrixClient.prototype.joinRoom = function(roomIdOrAlias, opts, callback) {
 
     const reqOpts = {qsStringifyOptions: {arrayFormat: 'repeat'}};
 
-    const defer = Promise.defer();
-
     const self = this;
-    sign_promise.then(function(signed_invite_object) {
-        const data = {};
-        if (signed_invite_object) {
-            data.third_party_signed = signed_invite_object;
-        }
+    const prom = new Promise((resolve, reject) => {
+        sign_promise.then(function(signed_invite_object) {
+            const data = {};
+            if (signed_invite_object) {
+                data.third_party_signed = signed_invite_object;
+            }
 
-        const path = utils.encodeUri("/join/$roomid", { $roomid: roomIdOrAlias});
-        return self._http.authedRequest(
-            undefined, "POST", path, queryString, data, reqOpts);
-    }).then(function(res) {
-        const roomId = res.room_id;
-        const syncApi = new SyncApi(self, self._clientOpts);
-        const room = syncApi.createRoom(roomId);
-        if (opts.syncRoom) {
-            // v2 will do this for us
-            // return syncApi.syncRoom(room);
-        }
-        return Promise.resolve(room);
-    }).done(function(room) {
-        _resolve(callback, defer, room);
-    }, function(err) {
-        _reject(callback, defer, err);
+            const path = utils.encodeUri("/join/$roomid", { $roomid: roomIdOrAlias});
+            return self._http.authedRequest(
+                undefined, "POST", path, queryString, data, reqOpts);
+        }).then(function(res) {
+            const roomId = res.room_id;
+            const syncApi = new SyncApi(self, self._clientOpts);
+            const room = syncApi.createRoom(roomId);
+            if (opts.syncRoom) {
+                // v2 will do this for us
+                // return syncApi.syncRoom(room);
+            }
+            return Promise.resolve(room);
+        }).then(function(room) {
+            _resolve(callback, resolve, room);
+        }, function(err) {
+            _reject(callback, reject, err);
+        });
     });
-    return defer.promise;
+    return prom;
 };
 
 /**
@@ -1591,7 +2149,7 @@ MatrixClient.prototype.joinRoom = function(roomIdOrAlias, opts, callback) {
  * @param {MatrixEvent} event The event to resend.
  * @param {Room} room Optional. The room the event is in. Will update the
  * timeline entry if provided.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.resendEvent = function(event, room) {
@@ -1625,7 +2183,7 @@ MatrixClient.prototype.cancelPendingEvent = function(event) {
  * @param {string} roomId
  * @param {string} name
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.setRoomName = function(roomId, name, callback) {
@@ -1637,7 +2195,7 @@ MatrixClient.prototype.setRoomName = function(roomId, name, callback) {
  * @param {string} roomId
  * @param {string} topic
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.setRoomTopic = function(roomId, topic, callback) {
@@ -1648,7 +2206,7 @@ MatrixClient.prototype.setRoomTopic = function(roomId, topic, callback) {
 /**
  * @param {string} roomId
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.getRoomTags = function(roomId, callback) {
@@ -1666,7 +2224,7 @@ MatrixClient.prototype.getRoomTags = function(roomId, callback) {
  * @param {string} tagName name of room tag to be set
  * @param {object} metadata associated with that tag to be stored
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.setRoomTag = function(roomId, tagName, metadata, callback) {
@@ -1684,7 +2242,7 @@ MatrixClient.prototype.setRoomTag = function(roomId, tagName, metadata, callback
  * @param {string} roomId
  * @param {string} tagName name of room tag to be removed
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.deleteRoomTag = function(roomId, tagName, callback) {
@@ -1703,7 +2261,7 @@ MatrixClient.prototype.deleteRoomTag = function(roomId, tagName, callback) {
  * @param {string} eventType event type to be set
  * @param {object} content event content
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.setRoomAccountData = function(roomId, eventType,
@@ -1725,7 +2283,7 @@ MatrixClient.prototype.setRoomAccountData = function(roomId, eventType,
  * @param {Number} powerLevel
  * @param {MatrixEvent} event
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.setPowerLevel = function(roomId, userId, powerLevel,
@@ -1753,7 +2311,7 @@ MatrixClient.prototype.setPowerLevel = function(roomId, userId, powerLevel,
  * @param {Object} content
  * @param {string} txnId Optional.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.sendEvent = function(roomId, eventType, content, txnId,
@@ -1768,7 +2326,7 @@ MatrixClient.prototype.sendEvent = function(roomId, eventType, content, txnId,
  * @param {object} eventObject An object with the partial structure of an event, to which event_id, user_id, room_id and origin_server_ts will be added.
  * @param {string} txnId the txnId.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype._sendCompleteEvent = function(roomId, eventObject, txnId,
@@ -1908,7 +2466,7 @@ function _sendEvent(client, room, event, callback) {
  * @param {module:models/room?} room destination room. Null if the destination
  *     is not a room we have seen over the sync pipe.
  *
- * @return {module:client.Promise?} Promise which resolves when the event has been
+ * @return {Promise?} Promise which resolves when the event has been
  *     encrypted, or null if nothing was needed
  */
 
@@ -2017,7 +2575,7 @@ function _sendEventHttpRequest(client, event) {
  * @param {string} [txnId]  transaction id. One will be made up if not
  *    supplied.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.redactEvent = function(roomId, eventId, txnId, callback) {
@@ -2033,7 +2591,7 @@ MatrixClient.prototype.redactEvent = function(roomId, eventId, txnId, callback) 
  * @param {Object} content
  * @param {string} txnId Optional.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.sendMessage = function(roomId, content, txnId, callback) {
@@ -2050,7 +2608,7 @@ MatrixClient.prototype.sendMessage = function(roomId, content, txnId, callback) 
  * @param {string} body
  * @param {string} txnId Optional.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.sendTextMessage = function(roomId, body, txnId, callback) {
@@ -2063,7 +2621,7 @@ MatrixClient.prototype.sendTextMessage = function(roomId, body, txnId, callback)
  * @param {string} body
  * @param {string} txnId Optional.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.sendNotice = function(roomId, body, txnId, callback) {
@@ -2076,7 +2634,7 @@ MatrixClient.prototype.sendNotice = function(roomId, body, txnId, callback) {
  * @param {string} body
  * @param {string} txnId Optional.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.sendEmoteMessage = function(roomId, body, txnId, callback) {
@@ -2090,7 +2648,7 @@ MatrixClient.prototype.sendEmoteMessage = function(roomId, body, txnId, callback
  * @param {Object} info
  * @param {string} text
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.sendImageMessage = function(roomId, url, info, text, callback) {
@@ -2115,7 +2673,7 @@ MatrixClient.prototype.sendImageMessage = function(roomId, url, info, text, call
  * @param {Object} info
  * @param {string} text
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.sendStickerMessage = function(roomId, url, info, text, callback) {
@@ -2140,7 +2698,7 @@ MatrixClient.prototype.sendStickerMessage = function(roomId, url, info, text, ca
  * @param {string} body
  * @param {string} htmlBody
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.sendHtmlMessage = function(roomId, body, htmlBody, callback) {
@@ -2153,7 +2711,7 @@ MatrixClient.prototype.sendHtmlMessage = function(roomId, body, htmlBody, callba
  * @param {string} body
  * @param {string} htmlBody
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.sendHtmlNotice = function(roomId, body, htmlBody, callback) {
@@ -2166,7 +2724,7 @@ MatrixClient.prototype.sendHtmlNotice = function(roomId, body, htmlBody, callbac
  * @param {string} body
  * @param {string} htmlBody
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.sendHtmlEmote = function(roomId, body, htmlBody, callback) {
@@ -2178,11 +2736,17 @@ MatrixClient.prototype.sendHtmlEmote = function(roomId, body, htmlBody, callback
  * Send a receipt.
  * @param {Event} event The event being acknowledged
  * @param {string} receiptType The kind of receipt e.g. "m.read"
+ * @param {object} opts Additional content to send alongside the receipt.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
-MatrixClient.prototype.sendReceipt = function(event, receiptType, callback) {
+MatrixClient.prototype.sendReceipt = function(event, receiptType, opts, callback) {
+    if (typeof(opts) === 'function') {
+        callback = opts;
+        opts = {};
+    }
+
     if (this.isGuest()) {
         return Promise.resolve({}); // guests cannot send receipts so don't bother.
     }
@@ -2193,7 +2757,7 @@ MatrixClient.prototype.sendReceipt = function(event, receiptType, callback) {
         $eventId: event.getId(),
     });
     const promise = this._http.authedRequest(
-        callback, "POST", path, undefined, {},
+        callback, "POST", path, undefined, opts || {},
     );
 
     const room = this.getRoom(event.getRoomId());
@@ -2206,17 +2770,32 @@ MatrixClient.prototype.sendReceipt = function(event, receiptType, callback) {
 /**
  * Send a read receipt.
  * @param {Event} event The event that has been read.
+ * @param {object} opts The options for the read receipt.
+ * @param {boolean} opts.hidden True to prevent the receipt from being sent to
+ * other users and homeservers. Default false (send to everyone). <b>This
+ * property is unstable and may change in the future.</b>
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
-MatrixClient.prototype.sendReadReceipt = async function(event, callback) {
+MatrixClient.prototype.sendReadReceipt = async function(event, opts, callback) {
+    if (typeof(opts) === 'function') {
+        callback = opts;
+        opts = {};
+    }
+    if (!opts) opts = {};
+
     const eventId = event.getId();
     const room = this.getRoom(event.getRoomId());
     if (room && room.hasPendingEvent(eventId)) {
         throw new Error(`Cannot set read receipt to a pending event (${eventId})`);
     }
-    return this.sendReceipt(event, "m.read", callback);
+
+    const addlContent = {
+        "m.hidden": Boolean(opts.hidden),
+    };
+
+    return this.sendReceipt(event, "m.read", addlContent, callback);
 };
 
 /**
@@ -2229,9 +2808,14 @@ MatrixClient.prototype.sendReadReceipt = async function(event, callback) {
  * @param {string} rrEvent the event tracked by the read receipt. This is here for
  * convenience because the RR and the RM are commonly updated at the same time as each
  * other. The local echo of this receipt will be done if set. Optional.
- * @return {module:client.Promise} Resolves: the empty object, {}.
+ * @param {object} opts Options for the read markers
+ * @param {object} opts.hidden True to hide the receipt from other users and homeservers.
+ * <b>This property is unstable and may change in the future.</b>
+ * @return {Promise} Resolves: the empty object, {}.
  */
-MatrixClient.prototype.setRoomReadMarkers = async function(roomId, rmEventId, rrEvent) {
+MatrixClient.prototype.setRoomReadMarkers = async function(
+    roomId, rmEventId, rrEvent, opts,
+) {
     const room = this.getRoom(roomId);
     if (room && room.hasPendingEvent(rmEventId)) {
         throw new Error(`Cannot set read marker to a pending event (${rmEventId})`);
@@ -2249,7 +2833,7 @@ MatrixClient.prototype.setRoomReadMarkers = async function(roomId, rmEventId, rr
         }
     }
 
-    return this.setRoomReadMarkersHttpRequest(roomId, rmEventId, rrEventId);
+    return this.setRoomReadMarkersHttpRequest(roomId, rmEventId, rrEventId, opts);
 };
 
 /**
@@ -2263,7 +2847,7 @@ MatrixClient.prototype.setRoomReadMarkers = async function(roomId, rmEventId, rr
  * recent one preceding this timestamp if available, or failing that the next
  * most recent available preview.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: Object of OG metadata.
+ * @return {Promise} Resolves: Object of OG metadata.
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  * May return synthesized attributes if the URL lacked OG meta.
  */
@@ -2275,11 +2859,13 @@ MatrixClient.prototype.getUrlPreview = function(url, ts, callback) {
     }
 
     const self = this;
-    return this._http.authedRequestWithPrefix(
+    return this._http.authedRequest(
         callback, "GET", "/preview_url", {
             url: url,
             ts: ts,
-        }, undefined, httpApi.PREFIX_MEDIA_R0,
+        }, undefined, {
+            prefix: PREFIX_MEDIA_R0,
+        },
     ).then(function(response) {
         // TODO: expire cache occasionally
         self.urlPreviewCache[key] = response;
@@ -2292,7 +2878,7 @@ MatrixClient.prototype.getUrlPreview = function(url, ts, callback) {
  * @param {boolean} isTyping
  * @param {Number} timeoutMs
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.sendTyping = function(roomId, isTyping, timeoutMs, callback) {
@@ -2369,6 +2955,7 @@ MatrixClient.prototype.getRoomUpgradeHistory = function(roomId, verifyLinks=fals
     while (tombstoneEvent) {
         const refRoom = this.getRoom(tombstoneEvent.getContent()['replacement_room']);
         if (!refRoom) break; // end of the chain
+        if (refRoom.roomId === currentRoom.roomId) break; // Tombstone is referencing it's own room
 
         if (verifyLinks) {
             createEvent = refRoom.currentState.getStateEvents("m.room.create", "");
@@ -2380,6 +2967,12 @@ MatrixClient.prototype.getRoomUpgradeHistory = function(roomId, verifyLinks=fals
 
         // Push to the end because we're looking forwards
         upgradeHistory.push(refRoom);
+        const roomIds = new Set(upgradeHistory.map((ref) => ref.roomId));
+        if (roomIds.size < upgradeHistory.length) {
+           // The last room added to the list introduced a previous roomId
+           // To avoid recursion, return the last rooms - 1
+           return upgradeHistory.slice(0, upgradeHistory.length - 1);
+        }
 
         // Set the current room to the reference room so we know where we're at
         currentRoom = refRoom;
@@ -2393,7 +2986,7 @@ MatrixClient.prototype.getRoomUpgradeHistory = function(roomId, verifyLinks=fals
  * @param {string} roomId
  * @param {string} userId
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.invite = function(roomId, userId, callback) {
@@ -2406,7 +2999,7 @@ MatrixClient.prototype.invite = function(roomId, userId, callback) {
  * @param {string} roomId The room to invite the user to.
  * @param {string} email The email address to invite.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.inviteByEmail = function(roomId, email, callback) {
@@ -2421,10 +3014,15 @@ MatrixClient.prototype.inviteByEmail = function(roomId, email, callback) {
  * @param {string} medium The medium to invite the user e.g. "email".
  * @param {string} address The address for the specified medium.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
-MatrixClient.prototype.inviteByThreePid = function(roomId, medium, address, callback) {
+MatrixClient.prototype.inviteByThreePid = async function(
+    roomId,
+    medium,
+    address,
+    callback,
+) {
     const path = utils.encodeUri(
         "/rooms/$roomId/invite",
         { $roomId: roomId },
@@ -2437,18 +3035,30 @@ MatrixClient.prototype.inviteByThreePid = function(roomId, medium, address, call
             errcode: "ORG.MATRIX.JSSDK_MISSING_PARAM",
         }));
     }
-
-    return this._http.authedRequest(callback, "POST", path, undefined, {
+    const params = {
         id_server: identityServerUrl,
         medium: medium,
         address: address,
-    });
+    };
+
+    if (
+        this.identityServer &&
+        this.identityServer.getAccessToken &&
+        await this.doesServerAcceptIdentityAccessToken()
+    ) {
+        const identityAccessToken = await this.identityServer.getAccessToken();
+        if (identityAccessToken) {
+            params.id_access_token = identityAccessToken;
+        }
+    }
+
+    return this._http.authedRequest(callback, "POST", path, undefined, params);
 };
 
 /**
  * @param {string} roomId
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.leave = function(roomId, callback) {
@@ -2464,7 +3074,7 @@ MatrixClient.prototype.leave = function(roomId, callback) {
  * @param {string} roomId The room ID to start leaving at
  * @param {boolean} includeFuture If true, the whole chain (past and future) of
  * upgraded rooms will be left.
- * @return {module:client.Promise} Resolves when completed with an object keyed
+ * @return {Promise} Resolves when completed with an object keyed
  * by room ID and value of the error encountered when leaving or null.
  */
 MatrixClient.prototype.leaveRoomChain = function(roomId, includeFuture=true) {
@@ -2505,7 +3115,7 @@ MatrixClient.prototype.leaveRoomChain = function(roomId, includeFuture=true) {
  * @param {string} userId
  * @param {string} reason Optional.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.ban = function(roomId, userId, reason, callback) {
@@ -2518,7 +3128,7 @@ MatrixClient.prototype.ban = function(roomId, userId, reason, callback) {
  * @param {boolean} deleteRoom True to delete the room from the store on success.
  * Default: true.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.forget = function(roomId, deleteRoom, callback) {
@@ -2542,7 +3152,7 @@ MatrixClient.prototype.forget = function(roomId, deleteRoom, callback) {
  * @param {string} roomId
  * @param {string} userId
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: Object (currently empty)
+ * @return {Promise} Resolves: Object (currently empty)
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.unban = function(roomId, userId, callback) {
@@ -2567,7 +3177,7 @@ MatrixClient.prototype.unban = function(roomId, userId, callback) {
  * @param {string} userId
  * @param {string} reason Optional.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.kick = function(roomId, userId, reason, callback) {
@@ -2584,7 +3194,7 @@ MatrixClient.prototype.kick = function(roomId, userId, reason, callback) {
  * @param {string} membershipValue
  * @param {string} reason
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 function _setMembershipState(client, roomId, userId, membershipValue, reason,
@@ -2612,7 +3222,7 @@ function _setMembershipState(client, roomId, userId, membershipValue, reason,
  * @param {string} membership
  * @param {string} reason
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 function _membershipChange(client, roomId, userId, membership, reason, callback) {
@@ -2652,7 +3262,7 @@ MatrixClient.prototype.getPushActionsForEvent = function(event) {
  * @param {string} info The kind of info to set (e.g. 'avatar_url')
  * @param {Object} data The JSON object to set.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.setProfileInfo = function(info, data, callback) {
@@ -2668,7 +3278,7 @@ MatrixClient.prototype.setProfileInfo = function(info, data, callback) {
 /**
  * @param {string} name
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.setDisplayName = function(name, callback) {
@@ -2680,7 +3290,7 @@ MatrixClient.prototype.setDisplayName = function(name, callback) {
 /**
  * @param {string} url
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.setAvatarUrl = function(url, callback) {
@@ -2704,7 +3314,7 @@ MatrixClient.prototype.setAvatarUrl = function(url, callback) {
  */
 MatrixClient.prototype.mxcUrlToHttp =
         function(mxcUrl, width, height, resizeMethod, allowDirectLinks) {
-    return contentRepo.getHttpUriForMxc(
+    return getHttpUriForMxc(
         this.baseUrl, mxcUrl, width, height, resizeMethod, allowDirectLinks,
     );
 };
@@ -2713,7 +3323,7 @@ MatrixClient.prototype.mxcUrlToHttp =
  * Sets a new status message for the user. The message may be null/falsey
  * to clear the message.
  * @param {string} newMessage The new message to set.
- * @return {module:client.Promise} Resolves: to nothing
+ * @return {Promise} Resolves: to nothing
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype._unstable_setStatusMessage = function(newMessage) {
@@ -2740,7 +3350,7 @@ MatrixClient.prototype._unstable_setStatusMessage = function(newMessage) {
  * @param {string} opts.presence One of "online", "offline" or "unavailable"
  * @param {string} opts.status_msg The status message to attach.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  * @throws If 'presence' isn't a valid presence enum value.
  */
@@ -2772,7 +3382,7 @@ function _presenceList(callback, client, opts, method) {
 /**
 * Retrieve current user presence list.
 * @param {module:client.callback} callback Optional.
-* @return {module:client.Promise} Resolves: TODO
+* @return {Promise} Resolves: TODO
 * @return {module:http-api.MatrixError} Rejects: with an error response.
 */
 MatrixClient.prototype.getPresenceList = function(callback) {
@@ -2783,7 +3393,7 @@ MatrixClient.prototype.getPresenceList = function(callback) {
 * Add users to the current user presence list.
 * @param {module:client.callback} callback Optional.
 * @param {string[]} userIds
-* @return {module:client.Promise} Resolves: TODO
+* @return {Promise} Resolves: TODO
 * @return {module:http-api.MatrixError} Rejects: with an error response.
 */
 MatrixClient.prototype.inviteToPresenceList = function(callback, userIds) {
@@ -2795,7 +3405,7 @@ MatrixClient.prototype.inviteToPresenceList = function(callback, userIds) {
 * Drop users from the current user presence list.
 * @param {module:client.callback} callback Optional.
 * @param {string[]} userIds
-* @return {module:client.Promise} Resolves: TODO
+* @return {Promise} Resolves: TODO
 * @return {module:http-api.MatrixError} Rejects: with an error response.
 **/
 MatrixClient.prototype.dropFromPresenceList = function(callback, userIds) {
@@ -2815,7 +3425,7 @@ MatrixClient.prototype.dropFromPresenceList = function(callback, userIds) {
  * @param {Integer} limit Optional. The maximum number of previous events to
  * pull in. Default: 30.
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: Room. If you are at the beginning
+ * @return {Promise} Resolves: Room. If you are at the beginning
  * of the timeline, <code>Room.oldState.paginationToken</code> will be
  * <code>null</code>.
  * @return {module:http-api.MatrixError} Rejects: with an error response.
@@ -2847,42 +3457,45 @@ MatrixClient.prototype.scrollback = function(room, limit, callback) {
     // reduce the required number of events appropriately
     limit = limit - numAdded;
 
-    const defer = Promise.defer();
+    const self = this;
+    const prom = new Promise((resolve, reject) => {
+        // wait for a time before doing this request
+        // (which may be 0 in order not to special case the code paths)
+        sleep(timeToWaitMs).then(function() {
+            return self._createMessagesRequest(
+                room.roomId,
+                room.oldState.paginationToken,
+                limit,
+                'b');
+        }).then(function(res) {
+            const matrixEvents = utils.map(res.chunk, _PojoToMatrixEventMapper(self));
+            if (res.state) {
+                const stateEvents = utils.map(res.state, _PojoToMatrixEventMapper(self));
+                room.currentState.setUnknownStateEvents(stateEvents);
+            }
+            room.addEventsToTimeline(matrixEvents, true, room.getLiveTimeline());
+            room.oldState.paginationToken = res.end;
+            if (res.chunk.length === 0) {
+                room.oldState.paginationToken = null;
+            }
+            self.store.storeEvents(room, matrixEvents, res.end, true);
+            self._ongoingScrollbacks[room.roomId] = null;
+            _resolve(callback, resolve, room);
+        }, function(err) {
+            self._ongoingScrollbacks[room.roomId] = {
+                errorTs: Date.now(),
+            };
+            _reject(callback, reject, err);
+        });
+    });
+
     info = {
-        promise: defer.promise,
+        promise: prom,
         errorTs: null,
     };
-    const self = this;
-    // wait for a time before doing this request
-    // (which may be 0 in order not to special case the code paths)
-    Promise.delay(timeToWaitMs).then(function() {
-        return self._createMessagesRequest(
-            room.roomId,
-            room.oldState.paginationToken,
-            limit,
-            'b');
-    }).done(function(res) {
-        const matrixEvents = utils.map(res.chunk, _PojoToMatrixEventMapper(self));
-        if (res.state) {
-            const stateEvents = utils.map(res.state, _PojoToMatrixEventMapper(self));
-            room.currentState.setUnknownStateEvents(stateEvents);
-        }
-        room.addEventsToTimeline(matrixEvents, true, room.getLiveTimeline());
-        room.oldState.paginationToken = res.end;
-        if (res.chunk.length === 0) {
-            room.oldState.paginationToken = null;
-        }
-        self.store.storeEvents(room, matrixEvents, res.end, true);
-        self._ongoingScrollbacks[room.roomId] = null;
-        _resolve(callback, defer, room);
-    }, function(err) {
-        self._ongoingScrollbacks[room.roomId] = {
-            errorTs: Date.now(),
-        };
-        _reject(callback, defer, err);
-    });
+
     this._ongoingScrollbacks[room.roomId] = info;
-    return defer.promise;
+    return prom;
 };
 
 /**
@@ -2895,7 +3508,7 @@ MatrixClient.prototype.scrollback = function(room, limit, callback) {
  * @param {EventTimelineSet} timelineSet  The timelineSet to look for the event in
  * @param {string} eventId  The ID of the event to look for
  *
- * @return {module:client.Promise} Resolves:
+ * @return {Promise} Resolves:
  *    {@link module:models/event-timeline~EventTimeline} including the given
  *    event
  */
@@ -3025,7 +3638,7 @@ function(roomId, fromToken, limit, dir, timelineFilter = undefined) {
  *    false to go forwards
  * @param {number}   [opts.limit = 30]         number of events to request
  *
- * @return {module:client.Promise} Resolves to a boolean: false if there are no
+ * @return {Promise} Resolves to a boolean: false if there are no
  *    events and we reached either end of the timeline; else true.
  */
 MatrixClient.prototype.paginateEventTimeline = function(eventTimeline, opts) {
@@ -3177,7 +3790,7 @@ MatrixClient.prototype.resetNotifTimelineSet = function() {
  * Peek into a room and receive updates about the room. This only works if the
  * history visibility for the room is world_readable.
  * @param {String} roomId The room to attempt to peek into.
- * @return {module:client.Promise} Resolves: Room object
+ * @return {Promise} Resolves: Room object
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.peekInRoom = function(roomId) {
@@ -3208,7 +3821,7 @@ MatrixClient.prototype.stopPeeking = function() {
  * @param {boolean} opts.allowRead True to set history visibility to
  * be world_readable. This gives guests read access *from this point forward*.
  * If false or not given, history visibility is not modified.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.setGuestAccess = function(roomId, opts) {
@@ -3231,14 +3844,9 @@ MatrixClient.prototype.setGuestAccess = function(roomId, opts) {
 
 /**
  * Requests an email verification token for the purposes of registration.
- * This API proxies the Identity Server /validate/email/requestToken API,
- * adding registration-specific behaviour. Specifically, if an account with
- * the given email address already exists, it will either send an email
- * to the address informing them of this or return M_THREEPID_IN_USE
- * (which one is up to the Home Server).
- *
- * requestEmailToken calls the equivalent API directly on the ID server,
- * therefore bypassing the registration-specific logic.
+ * This API requests a token from the homeserver.
+ * The doesServerRequireIdServerParam() method can be used to determine if
+ * the server requires the id_server parameter to be provided.
  *
  * Parameters and return value are as for requestEmailToken
 
@@ -3246,7 +3854,7 @@ MatrixClient.prototype.setGuestAccess = function(roomId, opts) {
  * @param {string} clientSecret As requestEmailToken
  * @param {number} sendAttempt As requestEmailToken
  * @param {string} nextLink As requestEmailToken
- * @return {module:client.Promise} Resolves: As requestEmailToken
+ * @return {Promise} Resolves: As requestEmailToken
  */
 MatrixClient.prototype.requestRegisterEmailToken = function(email, clientSecret,
                                                     sendAttempt, nextLink) {
@@ -3263,8 +3871,9 @@ MatrixClient.prototype.requestRegisterEmailToken = function(email, clientSecret,
 
 /**
  * Requests a text message verification token for the purposes of registration.
- * This API proxies the Identity Server /validate/msisdn/requestToken API,
- * adding registration-specific behaviour, as with requestRegisterEmailToken.
+ * This API requests a token from the homeserver.
+ * The doesServerRequireIdServerParam() method can be used to determine if
+ * the server requires the id_server parameter to be provided.
  *
  * @param {string} phoneCountry The ISO 3166-1 alpha-2 code for the country in which
  *    phoneNumber should be parsed relative to.
@@ -3272,7 +3881,7 @@ MatrixClient.prototype.requestRegisterEmailToken = function(email, clientSecret,
  * @param {string} clientSecret As requestEmailToken
  * @param {number} sendAttempt As requestEmailToken
  * @param {string} nextLink As requestEmailToken
- * @return {module:client.Promise} Resolves: As requestEmailToken
+ * @return {Promise} Resolves: As requestEmailToken
  */
 MatrixClient.prototype.requestRegisterMsisdnToken = function(phoneCountry, phoneNumber,
                                                     clientSecret, sendAttempt, nextLink) {
@@ -3291,21 +3900,19 @@ MatrixClient.prototype.requestRegisterMsisdnToken = function(phoneCountry, phone
 /**
  * Requests an email verification token for the purposes of adding a
  * third party identifier to an account.
- * This API proxies the Identity Server /validate/email/requestToken API,
- * adding specific behaviour for the addition of email addresses to an
- * account. Specifically, if an account with
- * the given email address already exists, it will either send an email
- * to the address informing them of this or return M_THREEPID_IN_USE
- * (which one is up to the Home Server).
- *
- * requestEmailToken calls the equivalent API directly on the ID server,
- * therefore bypassing the email addition specific logic.
+ * This API requests a token from the homeserver.
+ * The doesServerRequireIdServerParam() method can be used to determine if
+ * the server requires the id_server parameter to be provided.
+ * If an account with the given email address already exists and is
+ * associated with an account other than the one the user is authed as,
+ * it will either send an email to the address informing them of this
+ * or return M_THREEPID_IN_USE (which one is up to the Home Server).
  *
  * @param {string} email As requestEmailToken
  * @param {string} clientSecret As requestEmailToken
  * @param {number} sendAttempt As requestEmailToken
  * @param {string} nextLink As requestEmailToken
- * @return {module:client.Promise} Resolves: As requestEmailToken
+ * @return {Promise} Resolves: As requestEmailToken
  */
 MatrixClient.prototype.requestAdd3pidEmailToken = function(email, clientSecret,
                                                     sendAttempt, nextLink) {
@@ -3332,7 +3939,7 @@ MatrixClient.prototype.requestAdd3pidEmailToken = function(email, clientSecret,
  * @param {string} clientSecret As requestEmailToken
  * @param {number} sendAttempt As requestEmailToken
  * @param {string} nextLink As requestEmailToken
- * @return {module:client.Promise} Resolves: As requestEmailToken
+ * @return {Promise} Resolves: As requestEmailToken
  */
 MatrixClient.prototype.requestAdd3pidMsisdnToken = function(phoneCountry, phoneNumber,
                                                     clientSecret, sendAttempt, nextLink) {
@@ -3365,7 +3972,7 @@ MatrixClient.prototype.requestAdd3pidMsisdnToken = function(phoneCountry, phoneN
  * @param {number} sendAttempt As requestEmailToken
  * @param {string} nextLink As requestEmailToken
  * @param {module:client.callback} callback Optional. As requestEmailToken
- * @return {module:client.Promise} Resolves: As requestEmailToken
+ * @return {Promise} Resolves: As requestEmailToken
  */
 MatrixClient.prototype.requestPasswordEmailToken = function(email, clientSecret,
                                                     sendAttempt, nextLink) {
@@ -3391,7 +3998,7 @@ MatrixClient.prototype.requestPasswordEmailToken = function(email, clientSecret,
  * @param {string} clientSecret As requestEmailToken
  * @param {number} sendAttempt As requestEmailToken
  * @param {string} nextLink As requestEmailToken
- * @return {module:client.Promise} Resolves: As requestEmailToken
+ * @return {Promise} Resolves: As requestEmailToken
  */
 MatrixClient.prototype.requestPasswordMsisdnToken = function(phoneCountry, phoneNumber,
                                                     clientSecret, sendAttempt, nextLink) {
@@ -3413,17 +4020,32 @@ MatrixClient.prototype.requestPasswordMsisdnToken = function(phoneCountry, phone
  *
  * @param {string} endpoint The endpoint to send the request to
  * @param {object} params Parameters for the POST request
- * @return {module:client.Promise} Resolves: As requestEmailToken
+ * @return {Promise} Resolves: As requestEmailToken
  */
-MatrixClient.prototype._requestTokenFromEndpoint = function(endpoint, params) {
-    const id_server_url = url.parse(this.idBaseUrl);
-    if (id_server_url.host === null) {
-        throw new Error("Invalid ID server URL: " + this.idBaseUrl);
+MatrixClient.prototype._requestTokenFromEndpoint = async function(endpoint, params) {
+    const postParams = Object.assign({}, params);
+
+    // If the HS supports separate add and bind, then requestToken endpoints
+    // don't need an IS as they are all validated by the HS directly.
+    if (!await this.doesServerSupportSeparateAddAndBind() && this.idBaseUrl) {
+        const idServerUrl = url.parse(this.idBaseUrl);
+        if (!idServerUrl.host) {
+            throw new Error("Invalid ID server URL: " + this.idBaseUrl);
+        }
+        postParams.id_server = idServerUrl.host;
+
+        if (
+            this.identityServer &&
+            this.identityServer.getAccessToken &&
+            await this.doesServerAcceptIdentityAccessToken()
+        ) {
+            const identityAccessToken = await this.identityServer.getAccessToken();
+            if (identityAccessToken) {
+                postParams.id_access_token = identityAccessToken;
+            }
+        }
     }
 
-    const postParams = Object.assign({}, params, {
-        id_server: id_server_url.host,
-    });
     return this._http.request(
         undefined, "POST", endpoint, undefined,
         postParams,
@@ -3463,7 +4085,7 @@ MatrixClient.prototype.getRoomPushRule = function(scope, roomId) {
  * @param {string} scope "global" or device-specific.
  * @param {string} roomId the id of the room.
  * @param {string} mute the mute state.
- * @return {module:client.Promise} Resolves: result object
+ * @return {Promise} Resolves: result object
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.setRoomMutePushRule = function(scope, roomId, mute) {
@@ -3491,12 +4113,12 @@ MatrixClient.prototype.setRoomMutePushRule = function(scope, roomId, mute) {
         } else if (!hasDontNotifyRule) {
             // Remove the existing one before setting the mute push rule
             // This is a workaround to SYN-590 (Push rule update fails)
-            deferred = Promise.defer();
+            deferred = utils.defer();
             this.deletePushRule(scope, "room", roomPushRule.rule_id)
-            .done(function() {
+            .then(function() {
                 self.addPushRule(scope, "room", roomId, {
                     actions: ["dont_notify"],
-                }).done(function() {
+                }).then(function() {
                     deferred.resolve();
                 }, function(err) {
                     deferred.reject(err);
@@ -3510,26 +4132,26 @@ MatrixClient.prototype.setRoomMutePushRule = function(scope, roomId, mute) {
     }
 
     if (deferred) {
-        // Update this.pushRules when the operation completes
-        const ruleRefreshDeferred = Promise.defer();
-        deferred.done(function() {
-            self.getPushRules().done(function(result) {
-                self.pushRules = result;
-                ruleRefreshDeferred.resolve();
+        return new Promise((resolve, reject) => {
+            // Update this.pushRules when the operation completes
+            deferred.then(function() {
+                self.getPushRules().then(function(result) {
+                    self.pushRules = result;
+                    resolve();
+                }, function(err) {
+                    reject(err);
+                });
             }, function(err) {
-                ruleRefreshDeferred.reject(err);
-            });
-        }, function(err) {
-            // Update it even if the previous operation fails. This can help the
-            // app to recover when push settings has been modifed from another client
-            self.getPushRules().done(function(result) {
-                self.pushRules = result;
-                ruleRefreshDeferred.reject(err);
-            }, function(err2) {
-                ruleRefreshDeferred.reject(err);
+                // Update it even if the previous operation fails. This can help the
+                // app to recover when push settings has been modifed from another client
+                self.getPushRules().then(function(result) {
+                    self.pushRules = result;
+                    reject(err);
+                }, function(err2) {
+                    reject(err);
+                });
             });
         });
-        return ruleRefreshDeferred.promise;
     }
 };
 
@@ -3543,7 +4165,7 @@ MatrixClient.prototype.setRoomMutePushRule = function(scope, roomId, mute) {
  * @param {string=} opts.keys The keys to search on. Defaults to all keys. One
  * of "content.body", "content.name", "content.topic".
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.searchMessageText = function(opts, callback) {
@@ -3581,7 +4203,7 @@ MatrixClient.prototype.searchMessageText = function(opts, callback) {
  * @param {Object} opts
  * @param {string} opts.term     the term to search for
  * @param {Object} opts.filter   a JSON filter object to pass in the request
- * @return {module:client.Promise} Resolves: result object
+ * @return {Promise} Resolves: result object
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.searchRoomEvents = function(opts) {
@@ -3617,7 +4239,7 @@ MatrixClient.prototype.searchRoomEvents = function(opts) {
  * Take a result from an earlier searchRoomEvents call, and backfill results.
  *
  * @param  {object} searchResults  the results object to be updated
- * @return {module:client.Promise} Resolves: updated result object
+ * @return {Promise} Resolves: updated result object
  * @return {Error} Rejects: with an error response.
  */
 MatrixClient.prototype.backPaginateRoomEventsSearch = function(searchResults) {
@@ -3687,7 +4309,7 @@ MatrixClient.prototype._processRoomEventsSearch = function(searchResults, respon
 
 /**
  * Populate the store with rooms the user has left.
- * @return {module:client.Promise} Resolves: TODO - Resolved when the rooms have
+ * @return {Promise} Resolves: TODO - Resolved when the rooms have
  * been added to the data store.
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
@@ -3746,7 +4368,7 @@ MatrixClient.prototype.createFilter = function(content) {
  * @param {string} filterId The filter ID to retrieve
  * @param {boolean} allowCached True to allow cached filters to be returned.
  * Default: True.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.getFilter = function(userId, filterId, allowCached) {
@@ -3845,7 +4467,7 @@ MatrixClient.prototype.getOrCreateFilter = function(filterName, filter) {
  * Gets a bearer token from the Home Server that the user can
  * present to a third party in order to prove their ownership
  * of the Matrix account they are logged into.
- * @return {module:client.Promise} Resolves: Token object
+ * @return {Promise} Resolves: Token object
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.getOpenIdToken = function() {
@@ -3864,7 +4486,7 @@ MatrixClient.prototype.getOpenIdToken = function() {
 
 /**
  * @param {module:client.callback} callback Optional.
- * @return {module:client.Promise} Resolves: TODO
+ * @return {Promise} Resolves: TODO
  * @return {module:http-api.MatrixError} Rejects: with an error response.
  */
 MatrixClient.prototype.turnServer = function(callback) {
@@ -3877,6 +4499,81 @@ MatrixClient.prototype.turnServer = function(callback) {
  */
 MatrixClient.prototype.getTurnServers = function() {
     return this._turnServers || [];
+};
+
+/**
+ * Set whether to allow a fallback ICE server should be used for negotiating a
+ * WebRTC connection if the homeserver doesn't provide any servers. Defaults to
+ * false.
+ *
+ * @param {boolean} allow
+ */
+MatrixClient.prototype.setFallbackICEServerAllowed = function(allow) {
+    this._fallbackICEServerAllowed = allow;
+};
+
+/**
+ * Get whether to allow a fallback ICE server should be used for negotiating a
+ * WebRTC connection if the homeserver doesn't provide any servers. Defaults to
+ * false.
+ *
+ * @returns {boolean}
+ */
+MatrixClient.prototype.isFallbackICEServerAllowed = function() {
+    return this._fallbackICEServerAllowed;
+};
+
+// Synapse-specific APIs
+// =====================
+
+/**
+ * Determines if the current user is an administrator of the Synapse homeserver.
+ * Returns false if untrue or the homeserver does not appear to be a Synapse
+ * homeserver. <strong>This function is implementation specific and may change
+ * as a result.</strong>
+ * @return {boolean} true if the user appears to be a Synapse administrator.
+ */
+MatrixClient.prototype.isSynapseAdministrator = function() {
+    const path = utils.encodeUri(
+        "/_synapse/admin/v1/users/$userId/admin",
+        { $userId: this.getUserId() },
+    );
+    return this._http.authedRequest(
+        undefined, 'GET', path, undefined, undefined, {prefix: ''},
+    ).then(r => r['admin']); // pull out the specific boolean we want
+};
+
+/**
+ * Performs a whois lookup on a user using Synapse's administrator API.
+ * <strong>This function is implementation specific and may change as a
+ * result.</strong>
+ * @param {string} userId the User ID to look up.
+ * @return {object} the whois response - see Synapse docs for information.
+ */
+MatrixClient.prototype.whoisSynapseUser = function(userId) {
+    const path = utils.encodeUri(
+        "/_synapse/admin/v1/whois/$userId",
+        { $userId: userId },
+    );
+    return this._http.authedRequest(
+        undefined, 'GET', path, undefined, undefined, {prefix: ''},
+    );
+};
+
+/**
+ * Deactivates a user using Synapse's administrator API. <strong>This
+ * function is implementation specific and may change as a result.</strong>
+ * @param {string} userId the User ID to deactivate.
+ * @return {object} the deactivate response - see Synapse docs for information.
+ */
+MatrixClient.prototype.deactivateSynapseUser = function(userId) {
+    const path = utils.encodeUri(
+        "/_synapse/admin/v1/deactivate/$userId",
+        { $userId: userId },
+    );
+    return this._http.authedRequest(
+        undefined, 'POST', path, undefined, undefined, {prefix: ''},
+    );
 };
 
 // Higher level APIs
@@ -3941,7 +4638,7 @@ MatrixClient.prototype.startClient = async function(opts) {
     }
 
     if (this._crypto) {
-        this._crypto.uploadDeviceKeys().done();
+        this._crypto.uploadDeviceKeys();
         this._crypto.start();
     }
 
@@ -4010,13 +4707,14 @@ MatrixClient.prototype.stopClient = function() {
     global.clearTimeout(this._checkTurnServersTimeoutID);
 };
 
-/*
- * Query the server to see if it support members lazy loading
- * @return {Promise<boolean>} true if server supports lazy loading
+/**
+ * Get the API versions supported by the server, along with any
+ * unstable APIs it supports
+ * @return {Promise<object>} The server /versions response
  */
-MatrixClient.prototype.doesServerSupportLazyLoading = async function() {
-    if (this._serverSupportsLazyLoading === null) {
-        const response = await this._http.request(
+MatrixClient.prototype.getVersions = async function() {
+    if (this._serverVersionsCache === null) {
+        this._serverVersionsCache = await this._http.request(
             undefined, // callback
             "GET", "/_matrix/client/versions",
             undefined, // queryParams
@@ -4025,18 +4723,107 @@ MatrixClient.prototype.doesServerSupportLazyLoading = async function() {
                 prefix: '',
             },
         );
-
-        const versions = response["versions"];
-        const unstableFeatures = response["unstable_features"];
-
-        this._serverSupportsLazyLoading =
-            (versions && versions.includes("r0.5.0"))
-            || (unstableFeatures && unstableFeatures["m.lazy_load_members"]);
     }
-    return this._serverSupportsLazyLoading;
+    return this._serverVersionsCache;
 };
 
-/*
+/**
+ * Check if a particular spec version is supported by the server.
+ * @param {string} version The spec version (such as "r0.5.0") to check for.
+ * @return {Promise<bool>} Whether it is supported
+ */
+MatrixClient.prototype.isVersionSupported = async function(version) {
+    const { versions } = await this.getVersions();
+    return versions && versions.includes(version);
+};
+
+/**
+ * Query the server to see if it support members lazy loading
+ * @return {Promise<boolean>} true if server supports lazy loading
+ */
+MatrixClient.prototype.doesServerSupportLazyLoading = async function() {
+    const response = await this.getVersions();
+    if (!response) return false;
+
+    const versions = response["versions"];
+    const unstableFeatures = response["unstable_features"];
+
+    return (versions && versions.includes("r0.5.0"))
+        || (unstableFeatures && unstableFeatures["m.lazy_load_members"]);
+};
+
+/**
+ * Query the server to see if the `id_server` parameter is required
+ * when registering with an 3pid, adding a 3pid or resetting password.
+ * @return {Promise<boolean>} true if id_server parameter is required
+ */
+MatrixClient.prototype.doesServerRequireIdServerParam = async function() {
+    const response = await this.getVersions();
+    if (!response) return true;
+
+    const versions = response["versions"];
+
+    // Supporting r0.6.0 is the same as having the flag set to false
+    if (versions && versions.includes("r0.6.0")) {
+        return false;
+    }
+
+    const unstableFeatures = response["unstable_features"];
+    if (!unstableFeatures) return true;
+    if (unstableFeatures["m.require_identity_server"] === undefined) {
+        return true;
+    } else {
+        return unstableFeatures["m.require_identity_server"];
+    }
+};
+
+/**
+ * Query the server to see if the `id_access_token` parameter can be safely
+ * passed to the homeserver. Some homeservers may trigger errors if they are not
+ * prepared for the new parameter.
+ * @return {Promise<boolean>} true if id_access_token can be sent
+ */
+MatrixClient.prototype.doesServerAcceptIdentityAccessToken = async function() {
+    const response = await this.getVersions();
+    if (!response) return false;
+
+    const versions = response["versions"];
+    const unstableFeatures = response["unstable_features"];
+    return (versions && versions.includes("r0.6.0"))
+        || (unstableFeatures && unstableFeatures["m.id_access_token"]);
+};
+
+/**
+ * Query the server to see if it supports separate 3PID add and bind functions.
+ * This affects the sequence of API calls clients should use for these operations,
+ * so it's helpful to be able to check for support.
+ * @return {Promise<boolean>} true if separate functions are supported
+ */
+MatrixClient.prototype.doesServerSupportSeparateAddAndBind = async function() {
+    const response = await this.getVersions();
+    if (!response) return false;
+
+    const versions = response["versions"];
+    const unstableFeatures = response["unstable_features"];
+
+    return (versions && versions.includes("r0.6.0"))
+        || (unstableFeatures && unstableFeatures["m.separate_add_and_bind"]);
+};
+
+/**
+ * Query the server to see if it lists support for an unstable feature
+ * in the /versions response
+ * @param {string} feature the feature name
+ * @return {Promise<boolean>} true if the feature is supported
+ */
+MatrixClient.prototype.doesServerSupportUnstableFeature = async function(feature) {
+    const response = await this.getVersions();
+    if (!response) return false;
+    const unstableFeatures = response["unstable_features"];
+    return unstableFeatures && !!unstableFeatures[feature];
+};
+
+/**
  * Get if lazy loading members is being used.
  * @return {boolean} Whether or not members are lazy loaded by this client
  */
@@ -4044,7 +4831,7 @@ MatrixClient.prototype.hasLazyLoadMembersEnabled = function() {
     return !!this._clientOpts.lazyLoadMembers;
 };
 
-/*
+/**
  * Set a function which is called when /sync returns a 'limited' response.
  * It is called with a room ID and returns a boolean. It should return 'true' if the SDK
  * can SAFELY remove events from this room. It may not be safe to remove events if there
@@ -4111,15 +4898,20 @@ function setupCallEventHandler(client) {
         // callId: [Candidate]
     };
 
-    // Maintain a buffer of events before the client has synced for the first time.
-    // This buffer will be inspected to see if we should send incoming call
-    // notifications. It needs to be buffered to correctly determine if an
-    // incoming call has had a matching answer/hangup.
+    // The sync code always emits one event at a time, so it will patiently
+    // wait for us to finish processing a call invite before delivering the
+    // next event, even if that next event is a hangup. We therefore accumulate
+    // all our call events and then process them on the 'sync' event, ie.
+    // each time a sync has completed. This way, we can avoid emitting incoming
+    // call events if we get both the invite and answer/hangup in the same sync.
+    // This happens quite often, eg. replaying sync from storage, catchup sync
+    // after loading and after we've been offline for a bit.
     let callEventBuffer = [];
-    let isClientPrepared = false;
-    client.on("sync", function(state) {
-        if (state === "PREPARED") {
-            isClientPrepared = true;
+    function evaluateEventBuffer() {
+        if (client.getSyncState() === "SYNCING") {
+            // don't process any events until they are all decrypted
+            if (callEventBuffer.some((e) => e.isBeingDecrypted())) return;
+
             const ignoreCallIds = {}; // Set<String>
             // inspect the buffer and mark all calls which have been answered
             // or hung up before passing them to the call event handler.
@@ -4132,39 +4924,51 @@ function setupCallEventHandler(client) {
             }
             // now loop through the buffer chronologically and inject them
             callEventBuffer.forEach(function(e) {
-                if (ignoreCallIds[e.getContent().call_id]) {
-                    // This call has previously been ansered or hung up: ignore it
+                if (
+                    e.getType() === "m.call.invite" &&
+                    ignoreCallIds[e.getContent().call_id]
+                ) {
+                    // This call has previously been answered or hung up: ignore it
                     return;
                 }
                 callEventHandler(e);
             });
             callEventBuffer = [];
         }
-    });
-
-    client.on("event", onEvent);
+    }
+    client.on("sync", evaluateEventBuffer);
 
     function onEvent(event) {
-        if (event.getType().indexOf("m.call.") !== 0) {
-            // not a call event
-            if (event.isBeingDecrypted() || event.isDecryptionFailure()) {
-                // not *yet* a call event, but might become one...
-                event.once("Event.decrypted", onEvent);
-            }
-            return;
-        }
-        if (!isClientPrepared) {
+        // any call events or ones that might be once they're decrypted
+        if (event.getType().indexOf("m.call.") === 0 || event.isBeingDecrypted()) {
+            // queue up for processing once all events from this sync have been
+            // processed (see above).
             callEventBuffer.push(event);
-            return;
         }
-        callEventHandler(event);
+
+        if (event.isBeingDecrypted() || event.isDecryptionFailure()) {
+            // add an event listener for once the event is decrypted.
+            event.once("Event.decrypted", () => {
+                if (event.getType().indexOf("m.call.") === -1) return;
+
+                if (callEventBuffer.includes(event)) {
+                    // we were waiting for that event to decrypt, so recheck the buffer
+                    evaluateEventBuffer();
+                } else {
+                    // This one wasn't buffered so just run the event handler for it
+                    // straight away
+                    callEventHandler(event);
+                }
+            });
+        }
     }
+    client.on("event", onEvent);
 
     function callEventHandler(event) {
         const content = event.getContent();
         let call = content.call_id ? client.callList[content.call_id] : undefined;
         let i;
-        //console.log("RECV %s content=%s", event.getType(), JSON.stringify(content));
+        //console.info("RECV %s content=%s", event.getType(), JSON.stringify(content));
 
         if (event.getType() === "m.call.invite") {
             if (event.getSender() === client.credentials.userId) {
@@ -4186,7 +4990,7 @@ function setupCallEventHandler(client) {
                 );
             }
 
-            call = webRtcCall.createNewMatrixCall(client, event.getRoomId(), {
+            call = createNewMatrixCall(client, event.getRoomId(), {
                 forceTURN: client._forceTURN,
             });
             if (!call) {
@@ -4286,7 +5090,7 @@ function setupCallEventHandler(client) {
                 // if not live, store the fact that the call has ended because
                 // we're probably getting events backwards so
                 // the hangup will come before the invite
-                call = webRtcCall.createNewMatrixCall(client, event.getRoomId());
+                call = createNewMatrixCall(client, event.getRoomId());
                 if (call) {
                     call.callId = content.call_id;
                     call._initWithHangup(event);
@@ -4310,7 +5114,7 @@ function checkTurnServers(client) {
         return; // guests can't access TURN servers
     }
 
-    client.turnServer().done(function(res) {
+    client.turnServer().then(function(res) {
         if (res.uris) {
             logger.log("Got TURN URIs: " + res.uris + " refresh in " +
                 res.ttl + " secs");
@@ -4329,25 +5133,24 @@ function checkTurnServers(client) {
         }
     }, function(err) {
         logger.error("Failed to get TURN URIs");
-        client._checkTurnServersTimeoutID =
-            setTimeout(function() {
- checkTurnServers(client);
-}, 60000);
+        client._checkTurnServersTimeoutID = setTimeout(function() {
+            checkTurnServers(client);
+        }, 60000);
     });
 }
 
-function _reject(callback, defer, err) {
+function _reject(callback, reject, err) {
     if (callback) {
         callback(err);
     }
-    defer.reject(err);
+    reject(err);
 }
 
-function _resolve(callback, defer, res) {
+function _resolve(callback, resolve, res) {
     if (callback) {
         callback(null, res);
     }
-    defer.resolve(res);
+    resolve(res);
 }
 
 function _PojoToMatrixEventMapper(client) {
@@ -4386,11 +5189,6 @@ MatrixClient.prototype.getEventMapper = function() {
 MatrixClient.prototype.generateClientSecret = function() {
     return randomString(32);
 };
-
-/** */
-module.exports.MatrixClient = MatrixClient;
-/** */
-module.exports.CRYPTO_ENABLED = CRYPTO_ENABLED;
 
 // MatrixClient Event JSDocs
 
@@ -4619,6 +5417,32 @@ module.exports.CRYPTO_ENABLED = CRYPTO_ENABLED;
  */
 
 /**
+ * Fires when the trust status of a user changes
+ * If userId is the userId of the logged in user, this indicated a change
+ * in the trust status of the cross-signing data on the account.
+ *
+ * The cross-signing API is currently UNSTABLE and may change without notice.
+ *
+ * @event module:client~MatrixClient#"userTrustStatusChanged"
+ * @param {string} userId the userId of the user in question
+ * @param {UserTrustLevel} trustLevel The new trust level of the user
+ */
+
+/**
+ * Fires when the user's cross-signing keys have changed or cross-signing
+ * has been enabled/disabled. The client can use getStoredCrossSigningForUser
+ * with the user ID of the logged in user to check if cross-signing is
+ * enabled on the account. If enabled, it can test whether the current key
+ * is trusted using with checkUserTrust with the user ID of the logged
+ * in user. The checkOwnCrossSigningTrust function may be used to reconcile
+ * the trust in the account key.
+ *
+ * The cross-signing API is currently UNSTABLE and may change without notice.
+ *
+ * @event module:client~MatrixClient#"crossSigning.keysChanged"
+ */
+
+/**
  * Fires whenever new user-scoped account_data is added.
  * @event module:client~MatrixClient#"accountData"
  * @param {MatrixEvent} event The event describing the account_data just added
@@ -4653,6 +5477,8 @@ module.exports.CRYPTO_ENABLED = CRYPTO_ENABLED;
  * @param {object} data
  * @param {MatrixEvent} data.event the original verification request message
  * @param {Array} data.methods the verification methods that can be used
+ * @param {Number} data.timeout the amount of milliseconds that should be waited
+ *                 before cancelling the request automatically.
  * @param {Function} data.beginKeyVerification a function to call if a key
  *     verification should be performed.  The function takes one argument: the
  *     name of the key verification method (taken from data.methods) to use.
@@ -4673,6 +5499,21 @@ module.exports.CRYPTO_ENABLED = CRYPTO_ENABLED;
  * @event module:client~MatrixClient#"crypto.verification.start"
  * @param {module:crypto/verification/Base} verifier a verifier object to
  *     perform the key verification
+ */
+
+/**
+ * Fires when a secret request has been cancelled.  If the client is prompting
+ * the user to ask whether they want to share a secret, the prompt can be
+ * dismissed.
+ *
+ * The Secure Secret Storage API is currently UNSTABLE and may change without notice.
+ *
+ * @event module:client~MatrixClient#"crypto.secrets.requestCancelled"
+ * @param {object} data
+ * @param {string} data.user_id The user ID of the client that had requested the secret.
+ * @param {string} data.device_id The device ID of the client that had requested the
+ *     secret.
+ * @param {string} data.request_id The ID of the original request.
  */
 
 // EventEmitter JSDocs
@@ -4758,15 +5599,3 @@ module.exports.CRYPTO_ENABLED = CRYPTO_ENABLED;
  * @param {Object} err The error value, the "rejected" value or null.
  * @param {Object} data The data returned, the "resolved" value.
  */
-
- /**
-  * {@link https://github.com/kriskowal/q|A promise implementation (Q)}. Functions
-  * which return this will specify 2 return arguments. These arguments map to the
-  * "onFulfilled" and "onRejected" values of the Promise.
-  * @typedef {Object} Promise
-  * @static
-  * @property {Function} then promise.then(onFulfilled, onRejected, onProgress)
-  * @property {Function} catch promise.catch(onRejected)
-  * @property {Function} finally promise.finally(callback)
-  * @property {Function} done promise.done(onFulfilled, onRejected, onProgress)
-  */

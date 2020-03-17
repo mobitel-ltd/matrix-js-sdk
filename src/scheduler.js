@@ -1,5 +1,6 @@
 /*
 Copyright 2015, 2016 OpenMarket Ltd
+Copyright 2019 The Matrix.org Foundation C.I.C.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,15 +14,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-"use strict";
+
 /**
  * This is an internal module which manages queuing, scheduling and retrying
  * of requests.
  * @module scheduler
  */
-const utils = require("./utils");
-import Promise from 'bluebird';
-import logger from '../src/logger';
+import * as utils from "./utils";
+import {logger} from './logger';
 
 const DEBUG = false;  // set true to enable console logging.
 
@@ -37,7 +37,7 @@ const DEBUG = false;  // set true to enable console logging.
  * algorithm to apply when determining which events should be sent before the
  * given event. Defaults to {@link module:scheduler~MatrixScheduler.QUEUE_MESSAGES}.
  */
-function MatrixScheduler(retryAlgorithm, queueAlgorithm) {
+export function MatrixScheduler(retryAlgorithm, queueAlgorithm) {
     this.retryAlgorithm = retryAlgorithm || MatrixScheduler.RETRY_BACKOFF_RATELIMIT;
     this.queueAlgorithm = queueAlgorithm || MatrixScheduler.QUEUE_MESSAGES;
     this._queues = {
@@ -121,7 +121,7 @@ MatrixScheduler.prototype.queueEvent = function(event) {
     if (!this._queues[queueName]) {
         this._queues[queueName] = [];
     }
-    const defer = Promise.defer();
+    const defer = utils.defer();
     this._queues[queueName].push({
         event: event,
         defer: defer,
@@ -154,6 +154,11 @@ MatrixScheduler.RETRY_BACKOFF_RATELIMIT = function(event, attempts, err) {
     // we ship with browser-request which returns { cors: rejected } when trying
     // with no connection, so if we match that, give up since they have no conn.
     if (err.cors === "rejected") {
+        return -1;
+    }
+
+    // if event that we are trying to send is too large in any way then retrying won't help
+    if (err.name === "M_TOO_LARGE") {
         return -1;
     }
 
@@ -319,7 +324,3 @@ function debuglog() {
  * @return {Promise} Resolved/rejected depending on the outcome of the request.
  */
 
-/**
- * The MatrixScheduler class.
- */
-module.exports = MatrixScheduler;

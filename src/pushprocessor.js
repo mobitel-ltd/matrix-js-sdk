@@ -15,7 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import {escapeRegExp, globToRegexp} from "./utils";
+import {escapeRegExp, globToRegexp, isNullOrUndefined} from "./utils";
 
 /**
  * @module pushprocessor
@@ -42,6 +42,11 @@ const DEFAULT_OVERRIDE_RULES = [
                 kind: "event_match",
                 key: "type",
                 pattern: "m.room.tombstone",
+            },
+            {
+                kind: "event_match",
+                key: "state_key",
+                pattern: "",
             },
         ],
         actions: [
@@ -75,7 +80,7 @@ const DEFAULT_OVERRIDE_RULES = [
  * @constructor
  * @param {Object} client The Matrix client object to use
  */
-function PushProcessor(client) {
+export function PushProcessor(client) {
     const cachedGlobToRegex = {
         // $glob: RegExp,
     };
@@ -263,7 +268,7 @@ function PushProcessor(client) {
         }
 
         const val = valueForDottedKey(cond.key, ev);
-        if (!val || typeof val != 'string') {
+        if (typeof val !== 'string') {
             return false;
         }
 
@@ -299,10 +304,10 @@ function PushProcessor(client) {
 
         // special-case the first component to deal with encrypted messages
         const firstPart = parts[0];
-        if (firstPart == 'content') {
+        if (firstPart === 'content') {
             val = ev.getContent();
             parts.shift();
-        } else if (firstPart == 'type') {
+        } else if (firstPart === 'type') {
             val = ev.getType();
             parts.shift();
         } else {
@@ -311,11 +316,11 @@ function PushProcessor(client) {
         }
 
         while (parts.length > 0) {
-            const thispart = parts.shift();
-            if (!val[thispart]) {
+            const thisPart = parts.shift();
+            if (isNullOrUndefined(val[thisPart])) {
                 return null;
             }
-            val = val[thispart];
+            val = val[thisPart];
         }
         return val;
     };
@@ -456,6 +461,38 @@ PushProcessor.actionListToActionsObject = function(actionlist) {
 };
 
 /**
+ * Rewrites conditions on a client's push rules to match the defaults
+ * where applicable. Useful for upgrading push rules to more strict
+ * conditions when the server is falling behind on defaults.
+ * @param {object} incomingRules The client's existing push rules
+ * @returns {object} The rewritten rules
+ */
+PushProcessor.rewriteDefaultRules = function(incomingRules) {
+    let newRules = JSON.parse(JSON.stringify(incomingRules)); // deep clone
+
+    // These lines are mostly to make the tests happy. We shouldn't run into these
+    // properties missing in practice.
+    if (!newRules) newRules = {};
+    if (!newRules.global) newRules.global = {};
+    if (!newRules.global.override) newRules.global.override = [];
+
+    // Fix default override rules
+    newRules.global.override = newRules.global.override.map(r => {
+        const defaultRule = DEFAULT_OVERRIDE_RULES.find(d => d.rule_id === r.rule_id);
+        if (!defaultRule) return r;
+
+        // Copy over the actions, default, and conditions. Don't touch the user's
+        // preference.
+        r.default = defaultRule.default;
+        r.conditions = defaultRule.conditions;
+        r.actions = defaultRule.actions;
+        return r;
+    });
+
+    return newRules;
+};
+
+/**
  * @typedef {Object} PushAction
  * @type {Object}
  * @property {boolean} notify Whether this event should notify the user or not.
@@ -466,6 +503,4 @@ PushProcessor.actionListToActionsObject = function(actionlist) {
  * noise.
  */
 
-/** The PushProcessor class. */
-module.exports = PushProcessor;
 

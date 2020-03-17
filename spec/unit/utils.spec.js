@@ -1,15 +1,6 @@
-"use strict";
-import 'source-map-support/register';
-const utils = require("../../lib/utils");
-const testUtils = require("../test-utils");
-
-import expect from 'expect';
+import * as utils from "../../src/utils";
 
 describe("utils", function() {
-    beforeEach(function() {
-        testUtils.beforeEach(this); // eslint-disable-line babel/no-invalid-this
-    });
-
     describe("encodeParams", function() {
         it("should url encode and concat with &s", function() {
             const params = {
@@ -135,7 +126,7 @@ describe("utils", function() {
                 utils.checkObjectHasKeys({
                     foo: "bar",
                 }, ["foo"]);
-            }).toNotThrow();
+            }).not.toThrow();
         });
     });
 
@@ -152,7 +143,7 @@ describe("utils", function() {
                 utils.checkObjectHasNoAdditionalKeys({
                             foo: "bar",
                         }, ["foo"]);
-            }).toNotThrow();
+            }).not.toThrow();
         });
     });
 

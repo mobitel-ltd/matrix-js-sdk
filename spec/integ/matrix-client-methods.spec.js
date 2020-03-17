@@ -1,42 +1,23 @@
-"use strict";
-import 'source-map-support/register';
-const sdk = require("../..");
-const HttpBackend = require("matrix-mock-request");
-const publicGlobals = require("../../lib/matrix");
-const Room = publicGlobals.Room;
-const MemoryStore = publicGlobals.MemoryStore;
-const Filter = publicGlobals.Filter;
-const utils = require("../test-utils");
-const MockStorageApi = require("../MockStorageApi");
-
-import expect from 'expect';
+import * as utils from "../test-utils";
+import {CRYPTO_ENABLED} from "../../src/client";
+import {Filter, MemoryStore, Room} from "../../src/matrix";
+import {TestClient} from "../TestClient";
 
 describe("MatrixClient", function() {
-    const baseUrl = "http://localhost.or.something";
     let client = null;
     let httpBackend = null;
     let store = null;
-    let sessionStore = null;
     const userId = "@alice:localhost";
     const accessToken = "aseukfgwef";
 
     beforeEach(function() {
-        utils.beforeEach(this); // eslint-disable-line babel/no-invalid-this
-        httpBackend = new HttpBackend();
         store = new MemoryStore();
 
-        const mockStorage = new MockStorageApi();
-        sessionStore = new sdk.WebStorageSessionStore(mockStorage);
-
-        sdk.request(httpBackend.requestFn);
-        client = sdk.createClient({
-            baseUrl: baseUrl,
-            userId: userId,
-            deviceId: "aliceDevice",
-            accessToken: accessToken,
+        const testClient = new TestClient(userId, "aliceDevice", accessToken, undefined, {
             store: store,
-            sessionStore: sessionStore,
         });
+        httpBackend = testClient.httpBackend;
+        client = testClient.client;
     });
 
     afterEach(function() {
@@ -46,7 +27,7 @@ describe("MatrixClient", function() {
 
     describe("uploadContent", function() {
         const buf = new Buffer('hello world');
-        it("should upload the file", function(done) {
+        it("should upload the file", function() {
             httpBackend.when(
                 "POST", "/_matrix/media/r0/upload",
             ).check(function(req) {
@@ -74,25 +55,26 @@ describe("MatrixClient", function() {
             expect(uploads[0].promise).toBe(prom);
             expect(uploads[0].loaded).toEqual(0);
 
-            prom.then(function(response) {
+            const prom2 = prom.then(function(response) {
                 // for backwards compatibility, we return the raw JSON
                 expect(response).toEqual("content");
 
                 const uploads = client.getCurrentUploads();
                 expect(uploads.length).toEqual(0);
-            }).nodeify(done);
+            });
 
             httpBackend.flush();
+            return prom2;
         });
 
-        it("should parse the response if rawResponse=false", function(done) {
+        it("should parse the response if rawResponse=false", function() {
             httpBackend.when(
                 "POST", "/_matrix/media/r0/upload",
             ).check(function(req) {
                 expect(req.opts.json).toBeFalsy();
             }).respond(200, { "content_uri": "uri" });
 
-            client.uploadContent({
+            const prom = client.uploadContent({
                 stream: buf,
                 name: "hi.txt",
                 type: "text/plain",
@@ -100,12 +82,13 @@ describe("MatrixClient", function() {
                 rawResponse: false,
             }).then(function(response) {
                 expect(response.content_uri).toEqual("uri");
-            }).nodeify(done);
+            });
 
             httpBackend.flush();
+            return prom;
         });
 
-        it("should parse errors into a MatrixError", function(done) {
+        it("should parse errors into a MatrixError", function() {
             httpBackend.when(
                 "POST", "/_matrix/media/r0/upload",
             ).check(function(req) {
@@ -116,7 +99,7 @@ describe("MatrixClient", function() {
                 "error": "broken",
             });
 
-            client.uploadContent({
+            const prom = client.uploadContent({
                 stream: buf,
                 name: "hi.txt",
                 type: "text/plain",
@@ -126,12 +109,13 @@ describe("MatrixClient", function() {
                 expect(error.httpStatus).toEqual(400);
                 expect(error.errcode).toEqual("M_SNAFU");
                 expect(error.message).toEqual("broken");
-            }).nodeify(done);
+            });
 
             httpBackend.flush();
+            return prom;
         });
 
-        it("should return a promise which can be cancelled", function(done) {
+        it("should return a promise which can be cancelled", function() {
             const prom = client.uploadContent({
                 stream: buf,
                 name: "hi.txt",
@@ -143,17 +127,18 @@ describe("MatrixClient", function() {
             expect(uploads[0].promise).toBe(prom);
             expect(uploads[0].loaded).toEqual(0);
 
-            prom.then(function(response) {
+            const prom2 = prom.then(function(response) {
                 throw Error("request not aborted");
             }, function(error) {
                 expect(error).toEqual("aborted");
 
                 const uploads = client.getCurrentUploads();
                 expect(uploads.length).toEqual(0);
-            }).nodeify(done);
+            });
 
             const r = client.cancelUpload(prom);
             expect(r).toBe(true);
+            return prom2;
         });
     });
 
@@ -180,7 +165,7 @@ describe("MatrixClient", function() {
                 event_format: "client",
             });
             store.storeFilter(filter);
-            client.getFilter(userId, filterId, true).done(function(gotFilter) {
+            client.getFilter(userId, filterId, true).then(function(gotFilter) {
                 expect(gotFilter).toEqual(filter);
                 done();
             });
@@ -201,7 +186,7 @@ describe("MatrixClient", function() {
                 event_format: "client",
             });
             store.storeFilter(storeFilter);
-            client.getFilter(userId, filterId, false).done(function(gotFilter) {
+            client.getFilter(userId, filterId, false).then(function(gotFilter) {
                 expect(gotFilter.getDefinition()).toEqual(httpFilterDefinition);
                 done();
             });
@@ -219,7 +204,7 @@ describe("MatrixClient", function() {
             httpBackend.when(
                 "GET", "/user/" + encodeURIComponent(userId) + "/filter/" + filterId,
             ).respond(200, httpFilterDefinition);
-            client.getFilter(userId, filterId, true).done(function(gotFilter) {
+            client.getFilter(userId, filterId, true).then(function(gotFilter) {
                 expect(gotFilter.getDefinition()).toEqual(httpFilterDefinition);
                 expect(store.getFilter(userId, filterId)).toBeTruthy();
                 done();
@@ -247,7 +232,7 @@ describe("MatrixClient", function() {
                 filter_id: filterId,
             });
 
-            client.createFilter(filterDefinition).done(function(gotFilter) {
+            client.createFilter(filterDefinition).then(function(gotFilter) {
                 expect(gotFilter.getDefinition()).toEqual(filterDefinition);
                 expect(store.getFilter(userId, filterId)).toEqual(gotFilter);
                 done();
@@ -294,7 +279,7 @@ describe("MatrixClient", function() {
                 });
             }).respond(200, response);
 
-            httpBackend.flush().done(function() {
+            httpBackend.flush().then(function() {
                 done();
             });
         });
@@ -302,7 +287,7 @@ describe("MatrixClient", function() {
 
 
     describe("downloadKeys", function() {
-        if (!sdk.CRYPTO_ENABLED) {
+        if (!CRYPTO_ENABLED) {
             return;
         }
 
@@ -310,7 +295,7 @@ describe("MatrixClient", function() {
             return client.initCrypto();
         });
 
-        it("should do an HTTP request and then store the keys", function(done) {
+        it("should do an HTTP request and then store the keys", function() {
             const ed25519key = "7wG2lzAqbjcyEkOP7O4gU7ItYcn+chKzh5sT/5r2l78";
             // ed25519key = client.getDeviceEd25519Key();
             const borisKeys = {
@@ -372,7 +357,7 @@ describe("MatrixClient", function() {
                 },
             });
 
-            client.downloadKeys(["boris", "chaz"]).then(function(res) {
+            const prom = client.downloadKeys(["boris", "chaz"]).then(function(res) {
                 assertObjectContains(res.boris.dev1, {
                     verified: 0, // DeviceVerification.UNVERIFIED
                     keys: { "ed25519:dev1": ed25519key },
@@ -386,26 +371,26 @@ describe("MatrixClient", function() {
                     algorithms: ["2"],
                     unsigned: { "ghi": "def" },
                 });
-            }).nodeify(done);
+            });
 
             httpBackend.flush();
+            return prom;
         });
     });
 
     describe("deleteDevice", function() {
         const auth = {a: 1};
-        it("should pass through an auth dict", function(done) {
+        it("should pass through an auth dict", function() {
             httpBackend.when(
                 "DELETE", "/_matrix/client/r0/devices/my_device",
             ).check(function(req) {
                 expect(req.data).toEqual({auth: auth});
             }).respond(200);
 
-            client.deleteDevice(
-                "my_device", auth,
-            ).nodeify(done);
+            const prom = client.deleteDevice("my_device", auth);
 
             httpBackend.flush();
+            return prom;
         });
     });
 });

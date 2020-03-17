@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Script to perform a release of matrix-js-sdk.
+# Script to perform a release of matrix-js-sdk and downstream projects.
 #
 # Requires:
 #   github-changelog-generator; install via:
@@ -9,6 +9,8 @@
 #   hub; install via brew (macOS) or source/pre-compiled binaries (debian) (https://github.com/github/hub) - Tested on v2.2.9
 #   npm; typically installed by Node.js
 #   yarn; install via brew (macOS) or similar (https://yarnpkg.com/docs/install/)
+#
+# Note: this script is also used to release matrix-react-sdk and riot-web.
 
 set -e
 
@@ -195,6 +197,11 @@ if [ $dodist -eq 0 ]; then
     pushd "$builddir"
     git clone "$projdir" .
     git checkout "$rel_branch"
+    # We use Git branch / commit dependencies for some packages, and Yarn seems
+    # to have a hard time getting that right. See also
+    # https://github.com/yarnpkg/yarn/issues/4734. As a workaround, we clean the
+    # global cache here to ensure we get the right thing.
+    yarn cache clean
     yarn install
     # We haven't tagged yet, so tell the dist script what version
     # it's building
@@ -289,7 +296,14 @@ rm "${latest_changes}"
 
 # Login and publish continues to use `npm`, as it seems to have more clearly
 # defined options and semantics than `yarn` for writing to the registry.
-npm publish
+# Tag both releases and prereleases as `next` so the last stable release remains
+# the default.
+npm publish --tag next
+if [ $prerelease -eq 0 ]; then
+    # For a release, also add the default `latest` tag.
+    package=$(cat package.json | jq -er .name)
+    npm dist-tag add "$package@$release" latest
+fi
 
 if [ -z "$skip_jsdoc" ]; then
     echo "generating jsdocs"

@@ -23,12 +23,10 @@ limitations under the License.
 import {MatrixEvent} from "../../models/event";
 
 export function newVerificationError(code, reason, extradata) {
-    extradata = extradata || {};
-    extradata.code = code;
-    extradata.reason = reason;
+    const content = Object.assign({}, {code, reason}, extradata);
     return new MatrixEvent({
         type: "m.key.verification.cancel",
-        content: extradata,
+        content,
     });
 }
 
@@ -85,3 +83,13 @@ export const newUserMismatchError = errorFactory("m.user_error", "User mismatch"
 export const newInvalidMessageError = errorFactory(
     "m.invalid_message", "Invalid message",
 );
+
+export function errorFromEvent(event) {
+    const content = event.getContent();
+    if (content) {
+        const {code, reason} = content;
+        return {code, reason};
+    } else {
+        return {code: "Unknown error", reason: "m.unknown"};
+    }
+}

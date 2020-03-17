@@ -1,6 +1,7 @@
 /*
 Copyright 2017 Vector Creations Ltd
 Copyright 2018 New Vector Ltd
+Copyright 2019 The Matrix.org Foundation C.I.C.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,12 +16,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import expect from 'expect';
-import Promise from 'bluebird';
-
-import TestClient from '../TestClient';
-import testUtils from '../test-utils';
-import logger from '../../src/logger';
+import {TestClient} from '../TestClient';
+import * as testUtils from '../test-utils';
+import {logger} from '../../src/logger';
 
 const ROOM_ID = "!room:id";
 
@@ -88,8 +86,6 @@ describe("DeviceList management:", function() {
     }
 
     beforeEach(async function() {
-        testUtils.beforeEach(this); // eslint-disable-line babel/no-invalid-this
-
         // we create our own sessionStoreBackend so that we can use it for
         // another TestClient.
         sessionStoreBackend = new testUtils.MockStorageApi();

@@ -1,15 +1,11 @@
-"use strict";
-import 'source-map-support/register';
-const sdk = require("../..");
-const EventTimeline = sdk.EventTimeline;
-const utils = require("../test-utils");
+import * as utils from "../test-utils";
+import {EventTimeline} from "../../src/models/event-timeline";
+import {RoomState} from "../../src/models/room-state";
 
 function mockRoomStates(timeline) {
-    timeline._startState = utils.mock(sdk.RoomState, "startState");
-    timeline._endState = utils.mock(sdk.RoomState, "endState");
+    timeline._startState = utils.mock(RoomState, "startState");
+    timeline._endState = utils.mock(RoomState, "endState");
 }
-
-import expect from 'expect';
 
 describe("EventTimeline", function() {
     const roomId = "!foo:bar";
@@ -18,8 +14,6 @@ describe("EventTimeline", function() {
     let timeline;
 
     beforeEach(function() {
-        utils.beforeEach(this); // eslint-disable-line babel/no-invalid-this
-
         // XXX: this is a horrid hack; should use sinon or something instead to mock
         const timelineSet = { room: { roomId: roomId }};
         timelineSet.room.getUnfilteredTimelineSet = function() {
@@ -78,7 +72,7 @@ describe("EventTimeline", function() {
 
             expect(function() {
                 timeline.initialiseState(state);
-            }).toNotThrow();
+            }).not.toThrow();
             timeline.addEvent(event, false);
             expect(function() {
                 timeline.initialiseState(state);
@@ -121,7 +115,7 @@ describe("EventTimeline", function() {
             const next = {b: "b"};
             expect(function() {
                 timeline.setNeighbouringTimeline(prev, EventTimeline.BACKWARDS);
-            }).toNotThrow();
+            }).not.toThrow();
             expect(timeline.getNeighbouringTimeline(EventTimeline.BACKWARDS))
                 .toBe(prev);
             expect(function() {
@@ -130,7 +124,7 @@ describe("EventTimeline", function() {
 
             expect(function() {
                 timeline.setNeighbouringTimeline(next, EventTimeline.FORWARDS);
-            }).toNotThrow();
+            }).not.toThrow();
             expect(timeline.getNeighbouringTimeline(EventTimeline.FORWARDS))
                 .toBe(next);
             expect(function() {
@@ -187,14 +181,14 @@ describe("EventTimeline", function() {
                 name: "Old Alice",
             };
             timeline.getState(EventTimeline.FORWARDS).getSentinelMember
-                .andCall(function(uid) {
+                .mockImplementation(function(uid) {
                     if (uid === userA) {
                         return sentinel;
                     }
                     return null;
                 });
             timeline.getState(EventTimeline.BACKWARDS).getSentinelMember
-                .andCall(function(uid) {
+                .mockImplementation(function(uid) {
                     if (uid === userA) {
                         return oldSentinel;
                     }
@@ -229,14 +223,14 @@ describe("EventTimeline", function() {
                 name: "Old Alice",
             };
             timeline.getState(EventTimeline.FORWARDS).getSentinelMember
-                .andCall(function(uid) {
+                .mockImplementation(function(uid) {
                     if (uid === userA) {
                         return sentinel;
                     }
                     return null;
                 });
             timeline.getState(EventTimeline.BACKWARDS).getSentinelMember
-                .andCall(function(uid) {
+                .mockImplementation(function(uid) {
                     if (uid === userA) {
                         return oldSentinel;
                     }
@@ -281,7 +275,7 @@ describe("EventTimeline", function() {
             expect(events[1].forwardLooking).toBe(true);
 
             expect(timeline.getState(EventTimeline.BACKWARDS).setStateEvents).
-                toNotHaveBeenCalled();
+                not.toHaveBeenCalled();
         });
 
 
@@ -311,7 +305,7 @@ describe("EventTimeline", function() {
             expect(events[1].forwardLooking).toBe(false);
 
             expect(timeline.getState(EventTimeline.FORWARDS).setStateEvents).
-                toNotHaveBeenCalled();
+                not.toHaveBeenCalled();
         });
     });
 

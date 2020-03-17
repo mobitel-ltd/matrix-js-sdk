@@ -1,9 +1,5 @@
-"use strict";
-import 'source-map-support/register';
-const PushProcessor = require("../../lib/pushprocessor");
-const utils = require("../test-utils");
-
-import expect from 'expect';
+import * as utils from "../test-utils";
+import {PushProcessor} from "../../src/pushprocessor";
 
 describe('NotificationService', function() {
     const testUserId = "@ali:matrix.org";

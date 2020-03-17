@@ -1,6 +1,7 @@
 /*
 Copyright 2017 Vector Creations Ltd
 Copyright 2018, 2019 New Vector Ltd
+Copyright 2019 The Matrix.org Foundation C.I.C.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,14 +16,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import DeviceList from '../../../lib/crypto/DeviceList';
-import MemoryCryptoStore from '../../../lib/crypto/store/memory-crypto-store.js';
-import testUtils from '../../test-utils';
-import utils from '../../../lib/utils';
-import logger from '../../../src/logger';
-
-import expect from 'expect';
-import Promise from 'bluebird';
+import {logger} from "../../../src/logger";
+import * as utils from "../../../src/utils";
+import {MemoryCryptoStore} from "../../../src/crypto/store/memory-crypto-store";
+import {DeviceList} from "../../../src/crypto/DeviceList";
 
 const signedDeviceList = {
     "failures": {},
@@ -60,11 +57,9 @@ describe('DeviceList', function() {
     let deviceLists = [];
 
     beforeEach(function() {
-        testUtils.beforeEach(this); // eslint-disable-line babel/no-invalid-this
-
         deviceLists = [];
 
-        downloadSpy = expect.createSpy();
+        downloadSpy = jest.fn();
         cryptoStore = new MemoryCryptoStore();
     });
 
@@ -91,8 +86,8 @@ describe('DeviceList', function() {
 
         dl.startTrackingDeviceList('@test1:sw1v.org');
 
-        const queryDefer1 = Promise.defer();
-        downloadSpy.andReturn(queryDefer1.promise);
+        const queryDefer1 = utils.defer();
+        downloadSpy.mockReturnValue(queryDefer1.promise);
 
         const prom1 = dl.refreshOutdatedDeviceLists();
         expect(downloadSpy).toHaveBeenCalledWith(['@test1:sw1v.org'], {});
@@ -110,16 +105,16 @@ describe('DeviceList', function() {
 
         dl.startTrackingDeviceList('@test1:sw1v.org');
 
-        const queryDefer1 = Promise.defer();
-        downloadSpy.andReturn(queryDefer1.promise);
+        const queryDefer1 = utils.defer();
+        downloadSpy.mockReturnValue(queryDefer1.promise);
 
         const prom1 = dl.refreshOutdatedDeviceLists();
         expect(downloadSpy).toHaveBeenCalledWith(['@test1:sw1v.org'], {});
-        downloadSpy.reset();
+        downloadSpy.mockReset();
 
         // outdated notif arrives while the request is in flight.
-        const queryDefer2 = Promise.defer();
-        downloadSpy.andReturn(queryDefer2.promise);
+        const queryDefer2 = utils.defer();
+        downloadSpy.mockReturnValue(queryDefer2.promise);
 
         dl.invalidateUserDeviceList('@test1:sw1v.org');
         dl.refreshOutdatedDeviceLists();
@@ -136,10 +131,10 @@ describe('DeviceList', function() {
             // uh-oh; user restarts before second request completes. The new instance
             // should know we never got a complete device list.
             logger.log("Creating new devicelist to simulate app reload");
-            downloadSpy.reset();
+            downloadSpy.mockReset();
             const dl2 = createTestDeviceList();
-            const queryDefer3 = Promise.defer();
-            downloadSpy.andReturn(queryDefer3.promise);
+            const queryDefer3 = utils.defer();
+            downloadSpy.mockReturnValue(queryDefer3.promise);
 
             const prom3 = dl2.refreshOutdatedDeviceLists();
             expect(downloadSpy).toHaveBeenCalledWith(['@test1:sw1v.org'], {});

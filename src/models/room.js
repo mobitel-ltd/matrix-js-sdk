@@ -15,23 +15,21 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-"use strict";
+
 /**
  * @module models/room
  */
-const EventEmitter = require("events").EventEmitter;
 
-const EventStatus = require("./event").EventStatus;
-const RoomSummary = require("./room-summary");
-const RoomMember = require("./room-member");
-const MatrixEvent = require("./event").MatrixEvent;
-const utils = require("../utils");
-const ContentRepo = require("../content-repo");
-const EventTimeline = require("./event-timeline");
-const EventTimelineSet = require("./event-timeline-set");
-
-import logger from '../../src/logger';
-import ReEmitter from '../ReEmitter';
+import {EventEmitter} from "events";
+import {EventTimelineSet} from "./event-timeline-set";
+import {EventTimeline} from "./event-timeline";
+import {getHttpUriForMxc, getIdenticonUri} from "../content-repo";
+import * as utils from "../utils";
+import {EventStatus, MatrixEvent} from "./event";
+import {RoomMember} from "./room-member";
+import {RoomSummary} from "./room-summary";
+import {logger} from '../logger';
+import {ReEmitter} from '../ReEmitter';
 
 // These constants are used as sane defaults when the homeserver doesn't support
 // the m.room_versions capability. In practice, KNOWN_SAFE_ROOM_VERSION should be
@@ -39,8 +37,8 @@ import ReEmitter from '../ReEmitter';
 // room versions which are considered okay for people to run without being asked
 // to upgrade (ie: "stable"). Eventually, we should remove these when all homeservers
 // return an m.room_versions capability.
-const KNOWN_SAFE_ROOM_VERSION = '4';
-const SAFE_ROOM_VERSIONS = ['1', '2', '3', '4'];
+const KNOWN_SAFE_ROOM_VERSION = '5';
+const SAFE_ROOM_VERSIONS = ['1', '2', '3', '4', '5'];
 
 function synthesizeReceipt(userId, event, receiptType) {
     // console.log("synthesizing receipt for "+event.getId());
@@ -120,7 +118,7 @@ function synthesizeReceipt(userId, event, receiptType) {
  * @prop {*} storageToken A token which a data store can use to remember
  * the state of the room.
  */
-function Room(roomId, client, myUserId, opts) {
+export function Room(roomId, client, myUserId, opts) {
     opts = opts || {};
     opts.pendingEventOrdering = opts.pendingEventOrdering || "chronological";
 
@@ -378,6 +376,23 @@ Room.prototype.hasPendingEvent = function(eventId) {
  */
 Room.prototype.getLiveTimeline = function() {
     return this.getUnfilteredTimelineSet().getLiveTimeline();
+};
+
+
+/**
+ * Get the timestamp of the last message in the room
+ *
+ * @return {number} the timestamp of the last message in the room
+ */
+Room.prototype.getLastActiveTimestamp = function() {
+    const timeline = this.getLiveTimeline();
+    const events = timeline.getEvents();
+    if (events.length) {
+        const lastEvent = events[events.length - 1];
+        return lastEvent.getTs();
+    } else {
+        return Number.MIN_SAFE_INTEGER;
+    }
 };
 
 /**
@@ -796,11 +811,11 @@ Room.prototype.getAvatarUrl = function(baseUrl, width, height, resizeMethod,
 
     const mainUrl = roomAvatarEvent ? roomAvatarEvent.getContent().url : null;
     if (mainUrl) {
-        return ContentRepo.getHttpUriForMxc(
+        return getHttpUriForMxc(
             baseUrl, mainUrl, width, height, resizeMethod,
         );
     } else if (allowDefault) {
-        return ContentRepo.getIdenticonUri(
+        return getIdenticonUri(
             baseUrl, this.roomId, width, height,
         );
     }
@@ -822,9 +837,15 @@ Room.prototype.getAliases = function() {
         for (let i = 0; i < aliasEvents.length; ++i) {
             const aliasEvent = aliasEvents[i];
             if (utils.isArray(aliasEvent.getContent().aliases)) {
-                Array.prototype.push.apply(
-                    aliasStrings, aliasEvent.getContent().aliases,
-                );
+                const filteredAliases = aliasEvent.getContent().aliases.filter(a => {
+                    if (typeof(a) !== "string") return false;
+                    if (a[0] !== '#') return false;
+                    if (!a.endsWith(`:${aliasEvent.getStateKey()}`)) return false;
+
+                    // It's probably valid by here.
+                    return true;
+                });
+                Array.prototype.push.apply(aliasStrings, filteredAliases);
             }
         }
     }
@@ -840,9 +861,21 @@ Room.prototype.getAliases = function() {
 Room.prototype.getCanonicalAlias = function() {
     const canonicalAlias = this.currentState.getStateEvents("m.room.canonical_alias", "");
     if (canonicalAlias) {
-        return canonicalAlias.getContent().alias;
+        return canonicalAlias.getContent().alias || null;
     }
     return null;
+};
+
+/**
+ * Get this room's alternative aliases
+ * @return {array} The room's alternative aliases, or an empty array
+ */
+Room.prototype.getAltAliases = function() {
+    const canonicalAlias = this.currentState.getStateEvents("m.room.canonical_alias", "");
+    if (canonicalAlias) {
+        return canonicalAlias.getContent().alt_aliases || [];
+    }
+    return [];
 };
 
 /**
@@ -878,7 +911,7 @@ Room.prototype.addEventsToTimeline = function(events, toStartOfTimeline,
  * @return {RoomMember} The member or <code>null</code>.
  */
  Room.prototype.getMember = function(userId) {
-    return this.currentState.getMember(userId);
+     return this.currentState.getMember(userId);
  };
 
 /**
@@ -886,7 +919,7 @@ Room.prototype.addEventsToTimeline = function(events, toStartOfTimeline,
  * @return {RoomMember[]} A list of currently joined members.
  */
  Room.prototype.getJoinedMembers = function() {
-    return this.getMembersWithMembership("join");
+     return this.getMembersWithMembership("join");
  };
 
 /**
@@ -1046,10 +1079,11 @@ Room.prototype.removeFilteredTimelineSet = function(filter) {
  *
  * @param {MatrixEvent} event Event to be added
  * @param {string?} duplicateStrategy 'ignore' or 'replace'
+ * @param {boolean} fromCache whether the sync response came from cache
  * @fires module:client~MatrixClient#event:"Room.timeline"
  * @private
  */
-Room.prototype._addLiveEvent = function(event, duplicateStrategy) {
+Room.prototype._addLiveEvent = function(event, duplicateStrategy, fromCache) {
     if (event.isRedaction()) {
         const redactId = event.event.redacts;
 
@@ -1057,6 +1091,18 @@ Room.prototype._addLiveEvent = function(event, duplicateStrategy) {
         const redactedEvent = this.getUnfilteredTimelineSet().findEventById(redactId);
         if (redactedEvent) {
             redactedEvent.makeRedacted(event);
+
+            // If this is in the current state, replace it with the redacted version
+            if (redactedEvent.getStateKey()) {
+                const currentStateEvent = this.currentState.getStateEvents(
+                    redactedEvent.getType(),
+                    redactedEvent.getStateKey(),
+                );
+                if (currentStateEvent.getId() === redactedEvent.getId()) {
+                    this.currentState.setStateEvents([redactedEvent]);
+                }
+            }
+
             this.emit("Room.redaction", event, this);
 
             // TODO: we stash user displaynames (among other things) in
@@ -1084,7 +1130,7 @@ Room.prototype._addLiveEvent = function(event, duplicateStrategy) {
 
     // add to our timeline sets
     for (let i = 0; i < this._timelineSets.length; i++) {
-        this._timelineSets[i].addLiveEvent(event, duplicateStrategy);
+        this._timelineSets[i].addLiveEvent(event, duplicateStrategy, fromCache);
     }
 
     // synthesize and inject implicit read receipts
@@ -1175,7 +1221,7 @@ Room.prototype.addPendingEvent = function(event, txnId) {
         for (let i = 0; i < this._timelineSets.length; i++) {
             const timelineSet = this._timelineSets[i];
             if (timelineSet.getFilter()) {
-                if (this._filter.filterRoomTimeline([event]).length) {
+                if (timelineSet.getFilter().filterRoomTimeline([event]).length) {
                     timelineSet.addEventToTimeline(event,
                         timelineSet.getLiveTimeline(), false);
                 }
@@ -1204,7 +1250,7 @@ Room.prototype._aggregateNonLiveRelation = function(event) {
     for (let i = 0; i < this._timelineSets.length; i++) {
         const timelineSet = this._timelineSets[i];
         if (timelineSet.getFilter()) {
-            if (this._filter.filterRoomTimeline([event]).length) {
+            if (timelineSet.getFilter().filterRoomTimeline([event]).length) {
                 timelineSet.aggregateRelations(event);
             }
         } else {
@@ -1394,9 +1440,10 @@ Room.prototype._revertRedactionLocalEcho = function(redactionEvent) {
  * this function will be ignored entirely, preserving the existing event in the
  * timeline. Events are identical based on their event ID <b>only</b>.
  *
+ * @param {boolean} fromCache whether the sync response came from cache
  * @throws If <code>duplicateStrategy</code> is not falsey, 'replace' or 'ignore'.
  */
-Room.prototype.addLiveEvents = function(events, duplicateStrategy) {
+Room.prototype.addLiveEvents = function(events, duplicateStrategy, fromCache) {
     let i;
     if (duplicateStrategy && ["replace", "ignore"].indexOf(duplicateStrategy) === -1) {
         throw new Error("duplicateStrategy MUST be either 'replace' or 'ignore'");
@@ -1422,7 +1469,7 @@ Room.prototype.addLiveEvents = function(events, duplicateStrategy) {
     for (i = 0; i < events.length; i++) {
         // TODO: We should have a filter to say "only add state event
         // types X Y Z to the timeline".
-        this._addLiveEvent(events[i], duplicateStrategy);
+        this._addLiveEvent(events[i], duplicateStrategy, fromCache);
     }
 };
 
@@ -1875,11 +1922,6 @@ function memberNamesToRoomName(names, count = (names.length + 1)) {
         }
     }
 }
-
-/**
- * The Room class.
- */
-module.exports = Room;
 
 /**
  * Fires when an event we had previously received is redacted.
