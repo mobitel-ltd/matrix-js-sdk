@@ -61,10 +61,6 @@ export class ToDeviceChannel {
         return this._deviceId;
     }
 
-    get needsDoneMessage() {
-        return true;
-    }
-
     static getEventType(event) {
         return event.getType();
     }
@@ -359,5 +355,13 @@ export class ToDeviceRequests {
                 }
             }
         }
+    }
+
+    getRequestsInProgress(userId) {
+        const requestsByTxnId = this._requestsByUserId.get(userId);
+        if (requestsByTxnId) {
+            return Array.from(requestsByTxnId.values()).filter(r => r.pending);
+        }
+        return [];
     }
 }

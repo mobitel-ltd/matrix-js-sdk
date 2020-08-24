@@ -45,12 +45,6 @@ describe("Room", function() {
             expect(url.indexOf("flibble/wibble")).not.toEqual(-1);
         });
 
-        it("should return an identicon HTTP URL if allowDefault was set and there " +
-        "was no m.room.avatar event", function() {
-            const url = room.getAvatarUrl(hsUrl, 64, 64, "crop", true);
-            expect(url.indexOf("http")).toEqual(0); // don't care about form
-        });
-
         it("should return nothing if there is no m.room.avatar and allowDefault=false",
         function() {
             const url = room.getAvatarUrl(hsUrl, 64, 64, "crop", false);
@@ -617,15 +611,10 @@ describe("Room", function() {
                 }, event: true,
             })]);
         };
-        const setAliases = function(aliases, stateKey) {
-            if (!stateKey) {
-                stateKey = aliases.length
-                    ? aliases[0].split(':').splice(1).join(':') // domain+port
-                    : 'fibble';
-            }
+        const setAltAliases = function(aliases) {
             room.addLiveEvents([utils.mkEvent({
-                type: "m.room.aliases", room: roomId, skey: stateKey, content: {
-                    aliases: aliases,
+                type: "m.room.canonical_alias", room: roomId, skey: "", content: {
+                    alt_aliases: aliases,
                 }, event: true,
             })]);
         };
@@ -862,7 +851,7 @@ describe("Room", function() {
             "(invite join_rules) rooms if a room name doesn't exist.", function() {
                 const alias = "#room_alias:here";
                 setJoinRule("invite");
-                setAliases([alias, "#another:here"]);
+                setAltAliases([alias, "#another:here"]);
                 room.recalculate();
                 const name = room.name;
                 expect(name).toEqual(alias);
@@ -872,7 +861,7 @@ describe("Room", function() {
             "(public join_rules) rooms if a room name doesn't exist.", function() {
                 const alias = "#room_alias:here";
                 setJoinRule("public");
-                setAliases([alias, "#another:here"]);
+                setAltAliases([alias, "#another:here"]);
                 room.recalculate();
                 const name = room.name;
                 expect(name).toEqual(alias);
@@ -1384,7 +1373,7 @@ describe("Room", function() {
             let hasThrown = false;
             try {
                 await room.loadMembersIfNeeded();
-            } catch(err) {
+            } catch (err) {
                 hasThrown = true;
             }
             expect(hasThrown).toEqual(true);

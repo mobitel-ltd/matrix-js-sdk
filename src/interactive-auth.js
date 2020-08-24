@@ -143,11 +143,19 @@ InteractiveAuth.prototype = {
             this._resolveFunc = resolve;
             this._rejectFunc = reject;
 
-            // if we have no flows, try a request (we'll have
-            // just a session ID in _data if resuming)
-            if (!this._data.flows) {
+            const hasFlows = this._data && this._data.flows;
+
+            // if we have no flows, try a request to acquire the flows
+            if (!hasFlows) {
                 if (this._busyChangedCallback) this._busyChangedCallback(true);
-                this._doRequest(this._data).finally(() => {
+                // use the existing sessionid, if one is present.
+                let auth = null;
+                if (this._data.session) {
+                    auth = {
+                        session: this._data.session,
+                    };
+                }
+                this._doRequest(auth).finally(() => {
                     if (this._busyChangedCallback) this._busyChangedCallback(false);
                 });
             } else {
@@ -163,6 +171,8 @@ InteractiveAuth.prototype = {
      */
     poll: async function() {
         if (!this._data.session) return;
+        // likewise don't poll if there is no auth session in progress
+        if (!this._resolveFunc) return;
         // if we currently have a request in flight, there's no point making
         // another just to check what the status is
         if (this._submitPromise) return;
@@ -184,7 +194,11 @@ InteractiveAuth.prototype = {
                 }
                 authDict = {
                     type: EMAIL_STAGE_TYPE,
+                    // TODO: Remove `threepid_creds` once servers support proper UIA
+                    // See https://github.com/matrix-org/synapse/issues/5665
+                    // See https://github.com/matrix-org/matrix-doc/issues/2220
                     threepid_creds: creds,
+                    threepidCreds: creds,
                 };
             }
         }
@@ -262,11 +276,16 @@ InteractiveAuth.prototype = {
             }
         }
 
-        // use the sessionid from the last request.
-        const auth = {
-            session: this._data.session,
-        };
-        utils.extend(auth, authData);
+        // use the sessionid from the last request, if one is present.
+        let auth;
+        if (this._data.session) {
+            auth = {
+                session: this._data.session,
+            };
+            utils.extend(auth, authData);
+        } else {
+            auth = authData;
+        }
 
         try {
             // NB. the 'background' flag is deprecated by the busyChanged
@@ -318,10 +337,12 @@ InteractiveAuth.prototype = {
         try {
             const result = await this._requestCallback(auth, background);
             this._resolveFunc(result);
+            this._resolveFunc = null;
+            this._rejectFunc = null;
         } catch (error) {
             // sometimes UI auth errors don't come with flows
             const errorFlows = error.data ? error.data.flows : null;
-            const haveFlows = Boolean(this._data.flows) || Boolean(errorFlows);
+            const haveFlows = this._data.flows || Boolean(errorFlows);
             if (error.httpStatus !== 401 || !error.data || !haveFlows) {
                 // doesn't look like an interactive-auth failure.
                 if (!background) {
@@ -347,7 +368,13 @@ InteractiveAuth.prototype = {
                 error.data.session = this._data.session;
             }
             this._data = error.data;
-            this._startNextAuthStage();
+            try {
+                this._startNextAuthStage();
+            } catch (e) {
+                this._rejectFunc(e);
+                this._resolveFunc = null;
+                this._rejectFunc = null;
+            }
 
             if (
                 !this._emailSid &&
@@ -379,8 +406,10 @@ InteractiveAuth.prototype = {
                     // (or not being registered, depending on what we're trying
                     // to do) or it could be a network failure. Either way, pass
                     // the failure up as the user can't complete auth if we can't
-                    // send the email, foe whatever reason.
+                    // send the email, for whatever reason.
                     this._rejectFunc(e);
+                    this._resolveFunc = null;
+                    this._rejectFunc = null;
                 } finally {
                     this._requestingEmailToken = false;
                 }
@@ -408,7 +437,7 @@ InteractiveAuth.prototype = {
             return;
         }
 
-        if (this._data.errcode || this._data.error) {
+        if (this._data && this._data.errcode || this._data.error) {
             this._stateUpdatedCallback(nextStage, {
                 errcode: this._data.errcode || "",
                 error: this._data.error || "",

@@ -105,7 +105,7 @@ export declare function checkObjectHasNoAdditionalKeys(obj: object, allowedKeys:
  * @param {Object} obj The object to deep copy.
  * @return {Object} A copy of the object without any references to the original.
  */
-export declare function deepCopy(obj: object): object;
+export declare function deepCopy<T>(obj: T): T;
 /**
  * Compare two objects for equality. The objects MUST NOT have circular references.
  *
@@ -128,7 +128,7 @@ export declare function deepCompare(x: any, y: any): boolean;
  *
  * @return {Object} target
  */
-export declare function extend(): any;
+export declare function extend(...restParams: any[]): any;
 /**
  * Run polyfills to add Array.map and Array.filter if they are missing.
  */
@@ -179,3 +179,5 @@ export declare function defer(): {
 };
 export declare function promiseMapSeries<T>(promises: Promise<T>[], fn: (t: T) => void): Promise<void>;
 export declare function promiseTry<T>(fn: () => T): Promise<T>;
+export declare function setCrypto(c: Object): void;
+export declare function getCrypto(): Object;

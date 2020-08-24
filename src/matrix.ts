@@ -16,8 +16,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+import type Request from "request";
+
 import {MemoryCryptoStore} from "./crypto/store/memory-crypto-store";
+import {LocalStorageCryptoStore} from "./crypto/store/localStorage-crypto-store";
+import {IndexedDBCryptoStore} from "./crypto/store/indexeddb-crypto-store";
 import {MemoryStore} from "./store/memory";
+import {StubStore} from "./store/stub";
+import {LocalIndexedDBStoreBackend} from "./store/indexeddb-local-backend";
+import {RemoteIndexedDBStoreBackend} from "./store/indexeddb-remote-backend";
 import {MatrixScheduler} from "./scheduler";
 import {MatrixClient} from "./client";
 
@@ -89,6 +96,10 @@ export function wrapRequest(wrapper) {
     };
 }
 
+type Store =
+    StubStore | MemoryStore | LocalIndexedDBStoreBackend | RemoteIndexedDBStoreBackend;
+
+type CryptoStore = MemoryCryptoStore | LocalStorageCryptoStore | IndexedDBCryptoStore;
 
 let cryptoStoreFactory = () => new MemoryCryptoStore;
 
@@ -100,6 +111,15 @@ let cryptoStoreFactory = () => new MemoryCryptoStore;
  */
 export function setCryptoStoreFactory(fac) {
     cryptoStoreFactory = fac;
+}
+
+interface ICreateClientOpts {
+    baseUrl: string;
+    idBaseUrl?: string;
+    store?: Store;
+    cryptoStore?: CryptoStore;
+    scheduler?: MatrixScheduler;
+    request?: Request;
 }
 
 /**
@@ -125,10 +145,10 @@ export function setCryptoStoreFactory(fac) {
  * @see {@link module:client.MatrixClient} for the full list of options for
  * <code>opts</code>.
  */
-export function createClient(opts) {
+export function createClient(opts: ICreateClientOpts | string) {
     if (typeof opts === "string") {
         opts = {
-            "baseUrl": opts,
+            "baseUrl": opts as string,
         };
     }
     opts.request = opts.request || requestInstance;
@@ -167,7 +187,7 @@ export function createClient(opts) {
  * @param {requestCallback} callback The request callback.
  */
 
- /**
+/**
   * The request callback interface for performing HTTP requests. This matches the
   * API for the {@link https://github.com/request/request#requestoptions-callback|
   * request NPM module}. The SDK will implement a callback which meets this

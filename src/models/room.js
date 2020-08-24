@@ -23,7 +23,7 @@ limitations under the License.
 import {EventEmitter} from "events";
 import {EventTimelineSet} from "./event-timeline-set";
 import {EventTimeline} from "./event-timeline";
-import {getHttpUriForMxc, getIdenticonUri} from "../content-repo";
+import {getHttpUriForMxc} from "../content-repo";
 import * as utils from "../utils";
 import {EventStatus, MatrixEvent} from "./event";
 import {RoomMember} from "./room-member";
@@ -122,6 +122,10 @@ export function Room(roomId, client, myUserId, opts) {
     opts = opts || {};
     opts.pendingEventOrdering = opts.pendingEventOrdering || "chronological";
 
+    // In some cases, we add listeners for every displayed Matrix event, so it's
+    // common to have quite a few more than the default limit.
+    this.setMaxListeners(100);
+
     this.reEmitter = new ReEmitter(this);
 
     if (["chronological", "detached"].indexOf(opts.pendingEventOrdering) === -1) {
@@ -209,7 +213,7 @@ utils.inherits(Room, EventEmitter);
 Room.prototype.getVersion = function() {
     const createEvent = this.currentState.getStateEvents("m.room.create", "");
     if (!createEvent) {
-        logger.warn("Room " + this.room_id + " does not have an m.room.create event");
+        logger.warn("Room " + this.roomId + " does not have an m.room.create event");
         return '1';
     }
     const ver = createEvent.getContent()['room_version'];
@@ -675,7 +679,7 @@ Room.prototype.hasUnverifiedDevices = async function() {
     }
     const e2eMembers = await this.getEncryptionTargetMembers();
     for (const member of e2eMembers) {
-        const devices = await this._client.getStoredDevicesForUser(member.userId);
+        const devices = this._client.getStoredDevicesForUser(member.userId);
         if (devices.some((device) => device.isUnverified())) {
             return true;
         }
@@ -813,10 +817,6 @@ Room.prototype.getAvatarUrl = function(baseUrl, width, height, resizeMethod,
     if (mainUrl) {
         return getHttpUriForMxc(
             baseUrl, mainUrl, width, height, resizeMethod,
-        );
-    } else if (allowDefault) {
-        return getIdenticonUri(
-            baseUrl, this.roomId, width, height,
         );
     }
 
@@ -1278,6 +1278,11 @@ Room.prototype._handleRemoteEcho = function(remoteEvent, localEvent) {
     const newEventId = remoteEvent.getId();
     const oldStatus = localEvent.status;
 
+    logger.debug(
+        `Got remote echo for event ${oldEventId} -> ${newEventId} ` +
+        `old status ${oldStatus}`,
+    );
+
     // no longer pending
     delete this._txnToEvent[remoteEvent.getUnsigned().transaction_id];
 
@@ -1347,7 +1352,10 @@ ALLOWED_TRANSITIONS[EventStatus.CANCELLED] =
  * @fires module:client~MatrixClient#event:"Room.localEchoUpdated"
  */
 Room.prototype.updatePendingEvent = function(event, newStatus, newEventId) {
-    logger.log(`setting pendingEvent status to ${newStatus} in ${event.getRoomId()}`);
+    logger.log(
+        `setting pendingEvent status to ${newStatus} in ${event.getRoomId()} ` +
+        `event ID ${event.getId()} -> ${newEventId}`,
+    );
 
     // if the message was sent, we expect an event id
     if (newStatus == EventStatus.SENT && !newEventId) {
@@ -1785,8 +1793,9 @@ Room.prototype.addAccountData = function(events) {
         if (event.getType() === "m.tag") {
             this.addTags(event);
         }
+        const lastEvent = this.accountData[event.getType()];
         this.accountData[event.getType()] = event;
-        this.emit("Room.accountData", event, this);
+        this.emit("Room.accountData", event, this, lastEvent);
     }
 };
 
@@ -1833,7 +1842,7 @@ function calculateRoomName(room, userId, ignoreRoomNameEvent) {
     let alias = room.getCanonicalAlias();
 
     if (!alias) {
-        const aliases = room.getAliases();
+        const aliases = room.getAltAliases();
 
         if (aliases.length) {
             alias = aliases[0];
@@ -1891,14 +1900,14 @@ function calculateRoomName(room, userId, ignoreRoomNameEvent) {
     // let's try to figure out who was here before
     let leftNames = otherNames;
     // if we didn't have heroes, try finding them in the room state
-    if(!leftNames.length) {
+    if (!leftNames.length) {
         leftNames = room.currentState.getMembers().filter((m) => {
             return m.userId !== userId &&
                 m.membership !== "invite" &&
                 m.membership !== "join";
         }).map((m) => m.name);
     }
-    if(leftNames.length) {
+    if (leftNames.length) {
         return `Empty room (was ${memberNamesToRoomName(leftNames)})`;
     } else {
         return "Empty room";
@@ -1983,8 +1992,10 @@ function memberNamesToRoomName(names, count = (names.length + 1)) {
  * @event module:client~MatrixClient#"Room.accountData"
  * @param {event} event The account_data event
  * @param {Room} room The room whose account_data was updated.
+ * @param {MatrixEvent} prevEvent The event being replaced by
+ * the new account data, if known.
  * @example
- * matrixClient.on("Room.accountData", function(event, room){
+ * matrixClient.on("Room.accountData", function(event, room, oldEvent){
  *   if (event.getType() === "m.room.colorscheme") {
  *       applyColorScheme(event.getContents());
  *   }

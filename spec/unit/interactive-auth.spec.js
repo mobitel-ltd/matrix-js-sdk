@@ -97,7 +97,7 @@ describe("InteractiveAuth", function() {
         // first we expect a call to doRequest
         doRequest.mockImplementation(function(authData) {
             logger.log("request1", authData);
-            expect(authData).toEqual({});
+            expect(authData).toEqual(null); // first request should be null
             const err = new MatrixError({
                 session: "sessionId",
                 flows: [
@@ -141,6 +141,35 @@ describe("InteractiveAuth", function() {
             expect(res).toBe(requestRes);
             expect(doRequest).toBeCalledTimes(2);
             expect(stateUpdated).toBeCalledTimes(1);
+        });
+    });
+
+    it("should start an auth stage and reject if no auth flow", function() {
+        const doRequest = jest.fn();
+        const stateUpdated = jest.fn();
+
+        const ia = new InteractiveAuth({
+            matrixClient: new FakeClient(),
+            doRequest: doRequest,
+            stateUpdated: stateUpdated,
+        });
+
+        doRequest.mockImplementation(function(authData) {
+            logger.log("request1", authData);
+            expect(authData).toEqual(null); // first request should be null
+            const err = new MatrixError({
+                session: "sessionId",
+                flows: [],
+                params: {
+                    "logintype": { param: "aa" },
+                },
+            });
+            err.httpStatus = 401;
+            throw err;
+        });
+
+        return ia.attemptAuth().catch(function(error) {
+            expect(error.message).toBe('No appropriate authentication flow found');
         });
     });
 });
